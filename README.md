@@ -22,7 +22,13 @@ ASCENT provides three computational backends — the original SCENT algorithm (`
 
 *Benchmark on 2,286 CD14 Mono cells. The `glm` method uses base R `glm()` / `MASS::glm.nb()` and is identical to the original SCENT implementation. The `fastglm` method is an R-based optimisation developed as part of ASCENT that replaces the GLM solver with `fastglm::fastglm()`. The `rcpp` method is the full C++/OpenMP engine — the primary contribution of ASCENT.*
 
+![Benchmark: 1,800 Poisson pairs, 8 cores, 2,286 cells](fig/ascent_benchmark.png)
+
 ASCENT is a **drop-in replacement** for SCENT. The same statistical model (Poisson/Negative Binomial GLM with adaptive bootstrap p-values) is preserved. Only the computational engine changes.
+
+![Numerical accuracy: rcpp (ASCENT) vs glm (original SCENT) across 1,800 pairs](fig/ascent_accuracy.png)
+
+*Beta and SE are numerically identical (Spearman rho = 1.000000). Bootstrap p-values show high concordance (rho = 0.94); the scatter is expected because ASCENT and SCENT use independent RNG streams.*
 
 For a detailed explanation of the optimizations, see [DEEP_README.md](DEEP_README.md).
 
