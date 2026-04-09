@@ -1,0 +1,29 @@
+Package: ASCENT
+Type: Package
+Title: Accelerated Single-Cell ENhancer-Target Gene Linking
+Version: 1.0.0
+Authors@R: c(
+    person("Duc", "Nguyen", role = c("aut", "cre"), email = "dnguyen@example.com"),
+    person("Saori", "Sakaue", role = "ctb", comment = "Original SCENT implementation"),
+    person("Shakson", "Isaac", role = "ctb", comment = "Original SCENT implementation"))
+Description: Rcpp-accelerated reimplementation of SCENT (Single-Cell ENhancer Target)
+    for linking ATAC-seq peaks to target genes using single-cell multimodal data.
+    Uses Poisson or Negative Binomial regression with empirical p-values via
+    iterative bootstrapping. Parallelized across peak-gene pairs using OpenMP
+    with efficient sparse matrix access from C++.
+License: MIT + file LICENSE
+Depends:
+    R (>= 3.5.0),
+    methods
+Imports:
+    Rcpp,
+    Matrix,
+    data.table,
+    stringr,
+    Hmisc
+LinkingTo:
+    Rcpp,
+    RcppArmadillo
+SystemRequirements: GNU make, bedtools, C++11
+RoxygenNote: 7.3.2
+Encoding: UTF-8

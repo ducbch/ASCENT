@@ -1,0 +1,31 @@
+# Benchmark outputs
+benchmark_t1_output/
+benchmark_t2_output/
+benchmark_output/
+
+# Benchmark scripts (cluster-specific)
+run_benchmark*.R
+run_benchmark*.sh
+benchmark_ASCENT.ipynb
+
+# Jupyter
+.ipynb_checkpoints/
+
+# R package build artifacts
+*.o
+*.so
+*.dll
+*.rds
+*.Rhistory
+*.RData
+
+# SLURM logs
+slurm_*.log
+*.log
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
