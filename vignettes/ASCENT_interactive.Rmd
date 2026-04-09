@@ -1,0 +1,232 @@
+---
+title: "Getting Started with ASCENT"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting Started with ASCENT}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+## Overview
+
+ASCENT (Accelerated Single-Cell ENhancer Target gene linking) is a
+high-performance reimplementation of the
+[SCENT](https://github.com/immunogenomics/SCENT) algorithm. It tests for
+statistical association between chromatin accessibility (ATAC-seq peaks) and
+gene expression (RNA) across single cells using a GLM with adaptive bootstrap
+p-values.
+
+This vignette walks through the same workflow as the original SCENT
+`SCENT_interactive` vignette, showing how ASCENT serves as a drop-in
+replacement with identical results and significantly faster runtime.
+
+## Load Package
+
+```{r setup}
+library(ASCENT)
+library(Matrix)
+```
+
+## Step 1: Load Inputs
+
+ASCENT requires four inputs:
+
+- **RNA count matrix** (`dgCMatrix`): genes x cells
+- **ATAC count matrix** (`dgCMatrix`): peaks x cells
+- **Cell metadata** (`data.frame`): must include a `cell` column, covariates,
+  and a cell-type column
+- **Peak-gene pairs** (`data.frame`): two columns — `gene` and `peak`
+
+```{r load-inputs}
+# --- Option A: Load from individual RDS files ---
+atac <- readRDS("path/to/atac.rds")       # dgCMatrix, peaks x cells
+mrna <- readRDS("path/to/rna.rds")        # dgCMatrix, genes x cells
+meta <- readRDS("path/to/meta.rds")       # data.frame with cell metadata
+gene_peak <- read.table("path/to/gene_peak_pairs.txt")
+colnames(gene_peak) <- c("gene", "peak")
+
+# --- Option B: Extract from a Seurat multiome object ---
+# library(Seurat)
+# mrna <- GetAssayData(sobj, assay = "RNA",  layer = "counts")
+# atac <- GetAssayData(sobj, assay = "ATAC", layer = "counts")
+# meta <- data.frame(
+#   cell      = colnames(mrna),
+#   log_nUMI  = log(sobj$nCount_RNA),
+#   log_nATAC = log(sobj$nCount_ATAC),
+#   celltype  = sobj$celltype
+# )
+```
+
+## Step 2: Create an ASCENT Object
+
+The ASCENT S4 object holds all data needed for the analysis. This mirrors
+SCENT's `CreateSCENTObj()`.
+
+```{r create-object}
+obj <- CreateASCENTObj(
+  rna        = mrna,
+  atac       = atac,
+  meta.data  = meta,
+  peak.info  = gene_peak,
+  covariates = c("log_nUMI", "log_nATAC"),
+  celltypes  = "celltype"
+)
+
+# Inspect the object
+str(obj, max.level = 2)
+head(obj@peak.info)
+```
+
+## Step 3: (Optional) Select a Subset of Pairs
+
+For an interactive test run, you can subset to a small number of pairs:
+
+```{r subset-pairs}
+obj@peak.info <- obj@peak.info[1:10, ]
+head(obj@peak.info)
+```
+
+## Step 4: Run the ASCENT Algorithm
+
+`ASCENT_algorithm()` is a drop-in replacement for `SCENT_algorithm()`. The key
+addition is the `method` parameter, which selects the computational backend:
+
+- `"rcpp"` (default): Full C++/OpenMP engine. Use this for production runs.
+- `"fastglm"`: R-based optimisation using the `fastglm` library. Useful for
+  validation.
+- `"glm"`: Original SCENT implementation using base `glm()` / `MASS::glm.nb()`.
+  Useful as ground-truth reference.
+
+### Poisson regression (default, binarised ATAC)
+
+```{r run-poisson}
+result <- ASCENT_algorithm(
+  obj,
+  celltype = "CD14 Mono",
+  ncores   = 8L,
+  regr     = "poisson",
+  bin      = TRUE,
+  method   = "rcpp"
+)
+```
+
+### Negative binomial regression
+
+```{r run-negbin}
+result_nb <- ASCENT_algorithm(
+  obj,
+  celltype = "CD14 Mono",
+  ncores   = 8L,
+  regr     = "negbin",
+  bin      = TRUE,
+  method   = "rcpp"
+)
+```
+
+### All regression / binarisation combinations
+
+```{r run-all-options}
+# Poisson, binarised (default)
+res1 <- ASCENT_algorithm(obj, "CD14 Mono", 8L)
+
+# Poisson, non-binarised
+res2 <- ASCENT_algorithm(obj, "CD14 Mono", 8L, regr = "poisson", bin = FALSE)
+
+# Negative binomial, binarised
+res3 <- ASCENT_algorithm(obj, "CD14 Mono", 8L, regr = "negbin", bin = TRUE)
+
+# Negative binomial, non-binarised
+res4 <- ASCENT_algorithm(obj, "CD14 Mono", 8L, regr = "negbin", bin = FALSE)
+```
+
+## Step 5: View Results
+
+Results are stored in the `@ASCENT.result` slot (analogous to SCENT's
+`@SCENT.result`):
+
+```{r view-results}
+res <- result@ASCENT.result
+
+# Sort by bootstrap p-value
+res[order(res$boot_basic_p), ]
+```
+
+The output columns are:
+
+| Column | Description |
+|--------|-------------|
+| `gene` | Gene name |
+| `peak` | Peak name |
+| `beta` | ATAC coefficient from the GLM |
+| `se`   | Standard error of the ATAC coefficient |
+| `z`    | z-statistic (beta / se) |
+| `p`    | Wald p-value (two-sided) |
+| `boot_basic_p` | Empirical p-value from adaptive bootstrap |
+
+## Step 6: (Optional) Save Results
+
+```{r save-results}
+write.table(result@ASCENT.result,
+            file = "ASCENT_result.txt",
+            row.names = FALSE, col.names = TRUE, quote = FALSE)
+```
+
+## Scaling to Genome-wide Analyses
+
+The original SCENT required a separate parallelisation workflow for genome-wide
+analyses: splitting pairs into ~1,000 batches and submitting each as a separate
+cluster job (see SCENT's `SCENT_parallelize` vignette). This was necessary
+because SCENT parallelises *within* a single pair (bootstrap replicates via
+`mclapply` fork), so processing pairs remained sequential.
+
+ASCENT eliminates this complexity. The `rcpp` engine parallelises *across*
+pairs via OpenMP — simply increase `ncores` and all pairs are processed in
+parallel within a single R session:
+
+```{r genome-wide}
+# Generate all cis peak-gene pairs (requires bedtools)
+obj <- CreatePeakToGeneList(
+  obj,
+  genebed = "path/to/GeneBody_500kb_margin.bed",
+  nbatch  = 10
+)
+
+# Run on all pairs — just increase ncores
+obj@peak.info <- do.call(rbind, obj@peak.info.list)
+result <- ASCENT_algorithm(obj, "CD14 Mono", ncores = 16L, method = "rcpp")
+```
+
+No batch scripts, no job arrays, no result collection step.
+
+For very large analyses (>100k pairs), you can still split into batches
+using `obj@peak.info.list` and submit separate SLURM jobs, but far fewer
+batches are needed.
+
+## Comparison with SCENT
+
+ASCENT is designed as a drop-in replacement. The table below maps SCENT
+functions to their ASCENT equivalents:
+
+| SCENT | ASCENT | Notes |
+|-------|--------|-------|
+| `CreateSCENTObj()` | `CreateASCENTObj()` | Same arguments |
+| `SCENT_algorithm(obj, celltype, ncores)` | `ASCENT_algorithm(obj, celltype, ncores, method = "rcpp")` | Added `method` parameter |
+| `CreatePeakToGeneList()` | `CreatePeakToGeneList()` | Identical |
+| `obj@SCENT.result` | `obj@ASCENT.result` | Slot name changed |
+
+| | SCENT | ASCENT |
+|---|---|---|
+| **Parallelism** | Within pair (bootstrap replicates via fork) | Across pairs (OpenMP threads) |
+| **Genome-wide workflow** | Split into ~1,000 batches + job arrays | Single call with `ncores > 1` |
+| **Memory scaling** | ~N x base per N cores (fork duplication) | Constant regardless of core count |
+
+The `method = "glm"` backend produces numerically identical results to the
+original SCENT. The `method = "rcpp"` backend produces equivalent results with faster runtime.
