@@ -48,11 +48,8 @@ For a detailed explanation of the optimizations, see [DEEP_README.md](DEEP_READM
 # Install dependencies
 install.packages(c("Rcpp", "RcppArmadillo", "Matrix", "data.table", "stringr", "Hmisc"))
 
-# Install ASCENT from local source
-install.packages("/path/to/ASCENT", repos = NULL, type = "source")
-
-# Or using devtools from a git repository
-# devtools::install_github("username/ASCENT")
+# Install ASCENT from GitHub
+devtools::install_github("ducbch/ASCENT")
 ```
 
 ### Optional dependencies
