@@ -1,7 +1,13 @@
 # Benchmark outputs
 benchmark_t1_output/
 benchmark_t2_output/
+benchmark_t3_output/
 benchmark_output/
+
+# Working notes — ignore all .md except README and DEEP_README
+*.md
+!README.md
+!DEEP_README.md
 
 # Benchmark scripts (cluster-specific)
 run_benchmark*.R

@@ -5,3 +5,7 @@ ascent_process_pairs <- function(rna_sparse, atac_sparse, gene_idx_r, peak_idx_r
     .Call(`_ASCENT_ascent_process_pairs`, rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores)
 }
 
+ascent_score_pairs <- function(rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores) {
+    .Call(`_ASCENT_ascent_score_pairs`, rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores)
+}
+

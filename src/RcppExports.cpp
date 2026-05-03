@@ -33,8 +33,31 @@ BEGIN_RCPP
 END_RCPP
 }
 
+// ascent_score_pairs
+Rcpp::DataFrame ascent_score_pairs(Rcpp::S4 rna_sparse, Rcpp::S4 atac_sparse, Rcpp::IntegerVector gene_idx_r, Rcpp::IntegerVector peak_idx_r, Rcpp::StringVector gene_names_r, Rcpp::StringVector peak_names_r, arma::mat cov_mat, Rcpp::LogicalVector cell_mask, bool binarize, int regr_type, int ncores);
+RcppExport SEXP _ASCENT_ascent_score_pairs(SEXP rna_sparseSEXP, SEXP atac_sparseSEXP, SEXP gene_idx_rSEXP, SEXP peak_idx_rSEXP, SEXP gene_names_rSEXP, SEXP peak_names_rSEXP, SEXP cov_matSEXP, SEXP cell_maskSEXP, SEXP binarizeSEXP, SEXP regr_typeSEXP, SEXP ncoresSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::S4 >::type rna_sparse(rna_sparseSEXP);
+    Rcpp::traits::input_parameter< Rcpp::S4 >::type atac_sparse(atac_sparseSEXP);
+    Rcpp::traits::input_parameter< Rcpp::IntegerVector >::type gene_idx_r(gene_idx_rSEXP);
+    Rcpp::traits::input_parameter< Rcpp::IntegerVector >::type peak_idx_r(peak_idx_rSEXP);
+    Rcpp::traits::input_parameter< Rcpp::StringVector >::type gene_names_r(gene_names_rSEXP);
+    Rcpp::traits::input_parameter< Rcpp::StringVector >::type peak_names_r(peak_names_rSEXP);
+    Rcpp::traits::input_parameter< arma::mat >::type cov_mat(cov_matSEXP);
+    Rcpp::traits::input_parameter< Rcpp::LogicalVector >::type cell_mask(cell_maskSEXP);
+    Rcpp::traits::input_parameter< bool >::type binarize(binarizeSEXP);
+    Rcpp::traits::input_parameter< int >::type regr_type(regr_typeSEXP);
+    Rcpp::traits::input_parameter< int >::type ncores(ncoresSEXP);
+    rcpp_result_gen = Rcpp::wrap(ascent_score_pairs(rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores));
+    return rcpp_result_gen;
+END_RCPP
+}
+
 static const R_CallMethodDef CallEntries[] = {
     {"_ASCENT_ascent_process_pairs", (DL_FUNC) &_ASCENT_ascent_process_pairs, 11},
+    {"_ASCENT_ascent_score_pairs", (DL_FUNC) &_ASCENT_ascent_score_pairs, 11},
     {NULL, NULL, 0}
 };
 

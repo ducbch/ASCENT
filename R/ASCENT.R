@@ -43,6 +43,8 @@ interp_pval <- function(q) {
 #' @return Numeric scalar. Two-sided basic bootstrap p-value.
 #' @noRd
 basic_p <- function(obs, boot, null = 0) {
+  boot <- boot[!is.na(boot)]
+  if (length(boot) == 0) return(NA_real_)
   interp_pval(2 * obs - boot - null)
 }
 
@@ -325,8 +327,10 @@ basic_p <- function(obs, boot, null = 0) {
 #' @return Numeric vector of length 2: \code{c(coef_atac, var_atac)}.
 #' @noRd
 .assoc_negbin_glm <- function(data, idx = seq_len(nrow(data)), formula) {
-  gg <- MASS::glm.nb(formula, data = data[idx, , drop = FALSE])
-  c(coef(gg)["atac"], diag(vcov(gg))["atac"])
+  tryCatch({
+    gg <- MASS::glm.nb(formula, data = data[idx, , drop = FALSE])
+    c(coef(gg)["atac"], diag(vcov(gg))["atac"])
+  }, error = function(e) c(NA_real_, NA_real_))
 }
 
 #' ASCENT algorithm — native glm fallback path
@@ -439,6 +443,166 @@ basic_p <- function(obs, boot, null = 0) {
 
 
 # ================================================================
+# SCORE TEST ALGORITHM (Poisson, HC0 sandwich)
+# ================================================================
+
+#' Score test with HC0 sandwich variance (R path)
+#'
+#' For each gene, fits a null GLM (without peak term), then computes the
+#' robust score statistic for each linked peak using the HC0 sandwich
+#' estimator. Much faster than Wald + bootstrap because: (1) the null model
+#' is amortised across all peaks per gene, and (2) no bootstrap is needed.
+#'
+#' @param object ASCENT object.
+#' @param celltype Character. Cell type to analyse.
+#' @param regr Character. \code{"poisson"} or \code{"negbin"}.
+#' @param bin Logical. Binarise ATAC counts?
+#' @param method Character. \code{"glm"} or \code{"fastglm"} for null model.
+#'
+#' @return Data frame with columns: gene, peak, beta, se, z, score_U,
+#'   score_V, score_stat, score_p.
+#' @noRd
+.ASCENT_algorithm_score_r <- function(object, celltype, regr, bin,
+                                      method = "glm") {
+  if (method == "fastglm" && !requireNamespace("fastglm", quietly = TRUE))
+    stop("Install fastglm: install.packages('fastglm')")
+  if (regr == "negbin" && !requireNamespace("MASS", quietly = TRUE))
+    stop("Install MASS for negbin: install.packages('MASS')")
+
+  # Identify cells of the target celltype
+  meta <- object@meta.data
+  if ("cell" %in% colnames(meta)) rownames(meta) <- meta$cell
+  cell_ids <- colnames(object@rna)
+  meta_ordered <- meta[cell_ids, , drop = FALSE]
+  ct_col <- meta_ordered[[object@celltypes]]
+  is_target <- !is.na(ct_col) & ct_col == celltype
+  target_cells <- cell_ids[is_target]
+  n_cells <- length(target_cells)
+  if (n_cells < 10) return(data.frame())
+
+  # Covariate data for target cells
+  cov_target <- meta_ordered[target_cells, object@covariates, drop = FALSE]
+
+  # Group pairs by gene for null model amortisation
+  pairs <- object@peak.info
+  gene_groups <- split(seq_len(nrow(pairs)), pairs[[1]])
+
+  res_list <- vector("list", nrow(pairs))
+  res_idx <- 0
+  n_genes_done <- 0
+  n_genes_total <- length(gene_groups)
+
+  for (gene in names(gene_groups)) {
+    pair_indices <- gene_groups[[gene]]
+
+    # Extract gene expression for target cells
+    y <- as.numeric(object@rna[gene, target_cells])
+
+    # Gene sparsity filter
+    if (mean(y > 0) <= 0.05) { n_genes_done <- n_genes_done + 1; next }
+
+    # Fit null model (no peak term)
+    theta <- 0
+    if (method == "fastglm") {
+      X_null <- cbind(Intercept = 1, as.matrix(cov_target))
+      null_fit <- tryCatch({
+        if (regr == "poisson") {
+          fastglm::fastglm(x = X_null, y = y, family = poisson())
+        } else {
+          .negbin_fastglm(X_null, y)
+        }
+      }, error = function(e) NULL)
+      if (is.null(null_fit)) { n_genes_done <- n_genes_done + 1; next }
+      mu <- null_fit$fitted.values
+      if (regr == "negbin") theta <- null_fit$theta
+    } else {
+      df_null <- cov_target
+      df_null$exprs <- y
+      null_formula <- as.formula(
+        paste("exprs ~", paste(object@covariates, collapse = " + "))
+      )
+      null_fit <- tryCatch({
+        if (regr == "poisson") {
+          glm(null_formula, family = "poisson", data = df_null)
+        } else {
+          MASS::glm.nb(null_formula, data = df_null)
+        }
+      }, error = function(e) NULL)
+      if (is.null(null_fit)) { n_genes_done <- n_genes_done + 1; next }
+      mu <- fitted(null_fit)
+      X_null <- model.matrix(null_fit)
+      if (regr == "negbin") theta <- null_fit$theta
+    }
+
+    # Weights and weighted residuals
+    # Poisson: W = mu, e_star = y - mu
+    # NegBin:  W = mu*theta/(theta+mu), e_star = (y-mu)*theta/(theta+mu)
+    if (regr == "poisson") {
+      W      <- mu
+      e_star <- y - mu
+    } else {
+      W      <- mu * theta / (theta + mu)
+      e_star <- (y - mu) * theta / (theta + mu)
+    }
+
+    # Precompute (X'WX)^{-1} for WLS projection
+    XtWX_inv <- tryCatch(
+      solve(crossprod(X_null, X_null * W)),
+      error = function(e) NULL
+    )
+    if (is.null(XtWX_inv)) { n_genes_done <- n_genes_done + 1; next }
+
+    # Score test each peak linked to this gene
+    for (pi in pair_indices) {
+      peak <- pairs[[2]][pi]
+      z <- as.numeric(object@atac[peak, target_cells])
+      if (bin && any(z > 0)) z[z > 0] <- 1
+      if (mean(z > 0) <= 0.05) next
+
+      # b_tilde: residual of WLS regression of atac on X_null
+      # Weights: Poisson W=mu, NegBin W=mu*theta/(theta+mu)
+      b_tilde <- as.numeric(
+        z - X_null %*% (XtWX_inv %*% crossprod(X_null, W * z))
+      )
+
+      U <- sum(b_tilde * e_star)
+      V <- sum(b_tilde^2 * e_star^2)
+      if (V <= 0) next
+
+      # One-step Newton-Raphson beta from null: beta = U / I, se = sqrt(V) / I
+      I_info <- sum(b_tilde^2 * W)
+      if (I_info <= 0) next
+      beta_approx <- U / I_info
+      se_approx   <- sqrt(V) / I_info
+      z_approx    <- U / sqrt(V)
+
+      score_T <- U^2 / V
+      score_p <- pchisq(score_T, df = 1, lower.tail = FALSE)
+
+      res_idx <- res_idx + 1
+      res_list[[res_idx]] <- data.frame(
+        gene = gene, peak = peak,
+        beta = beta_approx, se = se_approx, z = z_approx,
+        score_U = U, score_V = V,
+        score_stat = score_T, score_p = score_p,
+        stringsAsFactors = FALSE
+      )
+    }
+
+    n_genes_done <- n_genes_done + 1
+    if (n_genes_done %% max(1, n_genes_total %/% 20) == 0) {
+      message(sprintf("  [%d / %d genes processed (%.0f%%)]",
+                      n_genes_done, n_genes_total,
+                      100 * n_genes_done / n_genes_total))
+    }
+  }
+
+  if (res_idx == 0) return(data.frame())
+  do.call(rbind, res_list[seq_len(res_idx)])
+}
+
+
+# ================================================================
 # S4 CLASS DEFINITION
 # ================================================================
 
@@ -538,13 +702,21 @@ CreateASCENTObj <- setClass(
 #' Run the ASCENT algorithm
 #'
 #' Tests for statistical association between chromatin accessibility (ATAC-seq
-#' peaks) and gene expression (RNA) across single cells using a GLM with
-#' adaptive bootstrap p-values. For each peak-gene pair in
-#' \code{object@@peak.info}, fits a Poisson or negative binomial GLM
-#' regressing gene expression on peak accessibility (controlling for
-#' covariates), then computes an empirical p-value via the basic bootstrap
-#' method with an adaptive resampling schedule (100 -> 500 -> 2,500 -> 25,000
-#' -> 50,000 replicates).
+#' peaks) and gene expression (RNA) across single cells using a GLM framework.
+#'
+#' Two testing strategies are available via the \code{test} argument:
+#' \describe{
+#'   \item{\code{"wald"}}{(default) Fits a full Poisson or NegBin GLM per
+#'     peak-gene pair including the peak as a predictor, then computes an
+#'     empirical p-value via the basic bootstrap method with an adaptive
+#'     resampling schedule (100 -> 500 -> 2,500 -> 25,000 -> 50,000
+#'     replicates).}
+#'   \item{\code{"score"}}{Fits a null model per gene (without the peak term),
+#'     then uses the robust score test with HC0 sandwich variance for each
+#'     linked peak. Much faster than Wald + bootstrap because the null model
+#'     is amortised across all peaks per gene and no bootstrap is needed.
+#'     Supports both Poisson and negative binomial.}
+#' }
 #'
 #' Pairs where either the gene or peak has <= 5\% nonzero values in the
 #' selected cell type are excluded from the output.
@@ -553,63 +725,83 @@ CreateASCENTObj <- setClass(
 #' @param celltype Character. Cell type to analyse. Must match a value in the
 #'   \code{celltypes} column of \code{meta.data}.
 #' @param ncores Integer. Number of threads. For \code{method = "rcpp"}, this
-#'   controls OpenMP threads parallelising across pairs. For \code{"fastglm"}
-#'   and \code{"glm"}, this controls \code{boot::boot(parallel = "multicore")}
-#'   cores for bootstrap replicates within each pair.
+#'   controls OpenMP threads parallelising across pairs (Wald) or genes
+#'   (score). For \code{"fastglm"} and \code{"glm"} with \code{test = "wald"},
+#'   this controls bootstrap cores.
 #' @param regr Character. Regression family: \code{"poisson"} (default) or
-#'   \code{"negbin"}. For negative binomial, the \code{"rcpp"} and
-#'   \code{"fastglm"} methods estimate theta once on the full data and fix it
-#'   during bootstrap; the \code{"glm"} method re-estimates theta on every
-#'   bootstrap replicate (matching original SCENT behaviour).
+#'   \code{"negbin"}.
 #' @param bin Logical. If \code{TRUE} (default), binarise ATAC counts
 #'   (nonzero values set to 1).
 #' @param method Character. Computational engine:
 #'   \describe{
-#'     \item{\code{"rcpp"}}{(default) Full C++/OpenMP engine. Fastest.
-#'       Parallelises across peak-gene pairs with IRLS GLM +
-#'       frequency-weighted bootstrap entirely in compiled code.}
-#'     \item{\code{"fastglm"}}{Pure-R fallback using the \pkg{fastglm} package
-#'       for GLM fitting. Bootstrap via \code{\link[boot]{boot}} with
-#'       multicore. Useful for validation or when C++ compilation is
-#'       unavailable.}
-#'     \item{\code{"glm"}}{Pure-R fallback using \code{\link[stats]{glm}}
-#'       (Poisson) or \code{\link[MASS]{glm.nb}} (NegBin). Identical to
-#'       original SCENT logic. Slowest — useful as ground-truth reference.}
+#'     \item{\code{"rcpp"}}{(default) Full C++/OpenMP engine. Fastest.}
+#'     \item{\code{"fastglm"}}{Pure-R fallback using \pkg{fastglm}.}
+#'     \item{\code{"glm"}}{Pure-R fallback using base \code{glm()}.}
 #'   }
+#' @param test Character. Testing strategy: \code{"wald"} (default) for
+#'   Wald test + adaptive bootstrap, or \code{"score"} for score test +
+#'   HC0 sandwich variance (no bootstrap, Poisson only).
 #'
 #' @return The input ASCENT object with the \code{@@ASCENT.result} slot
-#'   populated as a \code{data.frame} with columns: \code{gene}, \code{peak},
-#'   \code{beta} (ATAC coefficient), \code{se} (standard error), \code{z}
-#'   (z-statistic), \code{p} (Wald p-value), and \code{boot_basic_p}
-#'   (empirical bootstrap p-value).
+#'   populated as a \code{data.frame}. For \code{test = "wald"}: columns
+#'   \code{gene}, \code{peak}, \code{beta}, \code{se}, \code{z}, \code{p},
+#'   \code{boot_basic_p}. For \code{test = "score"}: columns \code{gene},
+#'   \code{peak}, \code{beta}, \code{se}, \code{z}, \code{score_U},
+#'   \code{score_V}, \code{score_stat}, \code{score_p}.
 #'
 #' @examples
 #' \dontrun{
+#' # Wald test with bootstrap (default)
 #' result <- ASCENT_algorithm(
 #'   obj,
 #'   celltype = "CD14 Mono",
 #'   ncores   = 8L,
 #'   regr     = "poisson",
 #'   bin      = TRUE,
-#'   method   = "rcpp"
+#'   method   = "rcpp",
+#'   test     = "wald"
 #' )
-#' res <- result@@ASCENT.result
-#' res[order(res$boot_basic_p), ]
+#'
+#' # Score test (faster, no bootstrap)
+#' result <- ASCENT_algorithm(
+#'   obj,
+#'   celltype = "CD14 Mono",
+#'   ncores   = 8L,
+#'   regr     = "poisson",
+#'   bin      = TRUE,
+#'   method   = "rcpp",
+#'   test     = "score"
+#' )
 #' }
 #'
 #' @export
 ASCENT_algorithm <- function(object, celltype, ncores = 1L,
                              regr = "poisson", bin = TRUE,
-                             method = "rcpp") {
+                             method = "rcpp", test = "wald") {
 
   # ---- Validate inputs ----
   stopifnot(inherits(object, "ASCENT"))
   stopifnot(nrow(object@peak.info) > 0)
   regr   <- match.arg(regr, c("poisson", "negbin"))
   method <- match.arg(method, c("rcpp", "fastglm", "glm"))
+  test   <- match.arg(test, c("wald", "score"))
 
-  # ---- Dispatch: R fallback paths ----
-  if (method %in% c("fastglm", "glm")) {
+  # ---- Score test dispatch ----
+  if (test == "score") {
+    if (method %in% c("fastglm", "glm")) {
+      message(sprintf(
+        "ASCENT [%s/score]: %d pairs | celltype='%s' | %s",
+        method, nrow(object@peak.info), celltype, regr
+      ))
+      res <- .ASCENT_algorithm_score_r(object, celltype, regr, bin, method)
+      object@ASCENT.result <- res
+      return(object)
+    }
+    # rcpp score test path — falls through to rcpp section below
+  }
+
+  # ---- Wald test: R fallback paths ----
+  if (test == "wald" && method %in% c("fastglm", "glm")) {
     message(sprintf(
       "ASCENT [%s]: %d pairs | celltype='%s' | %s | %d bootstrap cores",
       method, nrow(object@peak.info), celltype, regr, ncores
@@ -623,7 +815,7 @@ ASCENT_algorithm <- function(object, celltype, ncores = 1L,
     return(object)
   }
 
-  # ---- rcpp path ----
+  # ---- rcpp path (Wald or score) ----
   regr_int <- if (regr == "poisson") 0L else 1L
 
   # ---- Subset to relevant features for speed ----
@@ -667,25 +859,45 @@ ASCENT_algorithm <- function(object, celltype, ncores = 1L,
   gene_idx <- as.integer(gene_name_to_idx[pairs[[1]]])
   peak_idx <- as.integer(peak_name_to_idx[pairs[[2]]])
 
-  message(sprintf(
-    "ASCENT [rcpp]: %d pairs | %d cells (celltype='%s') | %s | %d threads",
-    nrow(pairs), sum(cell_mask), celltype, regr, ncores
-  ))
+  if (test == "score") {
+    message(sprintf(
+      "ASCENT [rcpp/score]: %d pairs | %d cells (celltype='%s') | %s | %d threads",
+      nrow(pairs), sum(cell_mask), celltype, regr, ncores
+    ))
 
-  # ---- Call C++ engine ----
-  res <- ascent_process_pairs(
-    rna_sparse   = rna_sub,
-    atac_sparse  = atac_sub,
-    gene_idx_r   = gene_idx,
-    peak_idx_r   = peak_idx,
-    gene_names_r = as.character(pairs[[1]]),
-    peak_names_r = as.character(pairs[[2]]),
-    cov_mat      = cov_mat,
-    cell_mask    = cell_mask,
-    binarize     = bin,
-    regr_type    = regr_int,
-    ncores       = as.integer(ncores)
-  )
+    res <- ascent_score_pairs(
+      rna_sparse   = rna_sub,
+      atac_sparse  = atac_sub,
+      gene_idx_r   = gene_idx,
+      peak_idx_r   = peak_idx,
+      gene_names_r = as.character(pairs[[1]]),
+      peak_names_r = as.character(pairs[[2]]),
+      cov_mat      = cov_mat,
+      cell_mask    = cell_mask,
+      binarize     = bin,
+      regr_type    = regr_int,
+      ncores       = as.integer(ncores)
+    )
+  } else {
+    message(sprintf(
+      "ASCENT [rcpp]: %d pairs | %d cells (celltype='%s') | %s | %d threads",
+      nrow(pairs), sum(cell_mask), celltype, regr, ncores
+    ))
+
+    res <- ascent_process_pairs(
+      rna_sparse   = rna_sub,
+      atac_sparse  = atac_sub,
+      gene_idx_r   = gene_idx,
+      peak_idx_r   = peak_idx,
+      gene_names_r = as.character(pairs[[1]]),
+      peak_names_r = as.character(pairs[[2]]),
+      cov_mat      = cov_mat,
+      cell_mask    = cell_mask,
+      binarize     = bin,
+      regr_type    = regr_int,
+      ncores       = as.integer(ncores)
+    )
+  }
 
   object@ASCENT.result <- res
   return(object)

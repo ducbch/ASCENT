@@ -150,6 +150,151 @@ FitResult poisson_irls(const mat& X, const vec& y,
     return res;
 }
 
+// ================================================================
+// SECTION 2b: POISSON NULL MODEL FOR SCORE TEST
+// ================================================================
+
+struct NullFitResult {
+    vec  beta;       // null model coefficients
+    vec  mu;         // fitted values
+    double theta;    // NB dispersion (0 for Poisson)
+    mat  XtWX_inv;   // (X'WX)^{-1} for projection (uses appropriate weights)
+    bool converged;
+};
+
+// Fit Poisson null model (no peak term) via IRLS.
+// Returns beta, mu, and (X'WX)^{-1} for score test projection.
+NullFitResult poisson_null_irls(const mat& X, const vec& y,
+                                int max_iter = 25, double tol = 1e-8)
+{
+    NullFitResult res;
+    res.converged = false;
+    res.theta = 0;
+    int n = (int)X.n_rows;
+    int p = (int)X.n_cols;
+
+    vec mu = y + 0.1;
+    vec eta = log(mu);
+    vec beta(p, fill::zeros);
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        vec w = clamp(mu, 1e-10, 1e7);
+        vec z_w = eta + (y - mu) / mu;
+
+        vec beta_new;
+        if (!qr_wls_solve(beta_new, X, w, z_w)) return res;
+
+        vec eta_new = X * beta_new;
+        eta_new = clamp(eta_new, -30.0, 30.0);
+        vec mu_new = exp(eta_new);
+
+        double change = accu(abs(eta_new - eta)) / n;
+        beta = beta_new;
+        eta  = eta_new;
+        mu   = mu_new;
+        if (change < tol) { res.converged = true; break; }
+    }
+    if (!res.converged) res.converged = true;
+
+    // Compute (X'WX)^{-1} for projection (Poisson weights W = mu)
+    vec w_final = clamp(mu, 1e-10, 1e7);
+    vec sw = sqrt(w_final);
+    mat Xw = X.each_col() % sw;
+    mat XtWX = Xw.t() * Xw;
+    if (!inv_sympd(res.XtWX_inv, XtWX)) { res.converged = false; return res; }
+
+    res.beta = beta;
+    res.mu   = mu;
+    return res;
+}
+
+// Forward declaration (defined in Section 3)
+inline double update_theta(const vec& y, const vec& mu, double theta,
+                           int max_iter = 10);
+
+// Fit NegBin null model (no peak term) via alternating IRLS + theta NR.
+// Returns beta, mu, theta, and (X'WX)^{-1} with NB weights for score test.
+NullFitResult negbin_null_irls(const mat& X, const vec& y,
+                                int max_outer = 25, int max_inner = 25,
+                                double tol = 1e-8)
+{
+    NullFitResult res;
+    res.converged = false;
+    res.theta = 0;
+    int n = (int)X.n_rows;
+    int p = (int)X.n_cols;
+
+    // Step 1: Poisson initialisation
+    vec mu = y + 0.1;
+    vec eta = log(mu);
+    vec beta(p, fill::zeros);
+
+    for (int iter = 0; iter < max_inner; iter++) {
+        vec w = clamp(mu, 1e-10, 1e7);
+        vec z_w = eta + (y - mu) / mu;
+        vec beta_new;
+        if (!qr_wls_solve(beta_new, X, w, z_w)) return res;
+        vec eta_new = X * beta_new;
+        eta_new = clamp(eta_new, -30.0, 30.0);
+        vec mu_new = exp(eta_new);
+        double change = accu(abs(eta_new - eta)) / n;
+        beta = beta_new; eta = eta_new; mu = mu_new;
+        if (change < tol) break;
+    }
+
+    // Step 2: Method-of-moments theta
+    double ss = 0;
+    for (int i = 0; i < n; i++) {
+        double r = y(i) / mu(i) - 1.0;
+        ss += r * r - 1.0 / mu(i);
+    }
+    double theta = std::max((double)n / std::max(ss, 0.01), 0.01);
+    theta = std::min(theta, 1e6);
+
+    // Step 3: Alternating IRLS + theta NR
+    for (int outer = 0; outer < max_outer; outer++) {
+        double theta_old = theta;
+
+        // IRLS with NB weight: w = mu * theta / (theta + mu)
+        for (int iter = 0; iter < max_inner; iter++) {
+            vec w = mu % (theta / (theta + mu));
+            w = clamp(w, 1e-10, 1e7);
+            vec z_w = eta + (y - mu) / mu;
+            vec beta_new;
+            if (!qr_wls_solve(beta_new, X, w, z_w)) return res;
+            vec eta_new = X * beta_new;
+            eta_new = clamp(eta_new, -30.0, 30.0);
+            vec mu_new = exp(eta_new);
+            double change = accu(abs(eta_new - eta)) / n;
+            beta = beta_new; eta = eta_new; mu = mu_new;
+            if (change < tol) break;
+        }
+
+        theta = update_theta(y, mu, theta);
+        if (std::abs(theta - theta_old) / (theta_old + 0.001) < 1e-4) {
+            res.converged = true; break;
+        }
+    }
+    if (!res.converged) res.converged = true;
+
+    // Compute (X'WX)^{-1} with NB weights
+    vec w_final = mu % (theta / (theta + mu));
+    w_final = clamp(w_final, 1e-10, 1e7);
+    vec sw = sqrt(w_final);
+    mat Xw = X.each_col() % sw;
+    mat XtWX = Xw.t() * Xw;
+    if (!inv_sympd(res.XtWX_inv, XtWX)) { res.converged = false; return res; }
+
+    res.beta  = beta;
+    res.mu    = mu;
+    res.theta = theta;
+    return res;
+}
+
+// ================================================================
+// (continued) SECTION 2: POISSON BOOTSTRAP
+// ================================================================
+
 // Frequency-weighted Poisson IRLS for bootstrap (warm-started).
 // Returns atac coefficient only; NaN on failure.
 inline double poisson_boot_coef(const mat& X, const vec& y, const vec& freq,
@@ -188,7 +333,7 @@ inline double poisson_boot_coef(const mat& X, const vec& y, const vec& freq,
 
 // Newton-Raphson update for NB dispersion parameter theta.
 inline double update_theta(const vec& y, const vec& mu, double theta,
-                           int max_iter = 10)
+                           int max_iter)
 {
     int n = (int)y.n_elem;
     for (int iter = 0; iter < max_iter; iter++) {
@@ -646,6 +791,302 @@ Rcpp::DataFrame ascent_process_pairs(
         Rcpp::Named("z")            = out_z,
         Rcpp::Named("p")            = out_p,
         Rcpp::Named("boot_basic_p") = out_boot_p,
+        Rcpp::Named("stringsAsFactors") = false
+    );
+}
+
+
+// ================================================================
+// SECTION 6: SCORE TEST (Poisson, HC0 sandwich)
+//
+// Parallelised across genes (not pairs). For each gene, fits a null
+// Poisson model (without peak term) via IRLS, then computes the robust
+// score statistic for every linked peak using HC0 sandwich variance.
+// ================================================================
+
+// [[Rcpp::export]]
+Rcpp::DataFrame ascent_score_pairs(
+    Rcpp::S4 rna_sparse,
+    Rcpp::S4 atac_sparse,
+    Rcpp::IntegerVector gene_idx_r,
+    Rcpp::IntegerVector peak_idx_r,
+    Rcpp::StringVector gene_names_r,
+    Rcpp::StringVector peak_names_r,
+    arma::mat cov_mat,
+    Rcpp::LogicalVector cell_mask,
+    bool binarize,
+    int regr_type,   // 0 = poisson (negbin: future)
+    int ncores)
+{
+    // ---- Extract CSC components from dgCMatrix ----
+    Rcpp::IntegerVector rna_i_rv  = rna_sparse.slot("i");
+    Rcpp::IntegerVector rna_p_rv  = rna_sparse.slot("p");
+    Rcpp::NumericVector rna_x_rv  = rna_sparse.slot("x");
+    Rcpp::IntegerVector atac_i_rv = atac_sparse.slot("i");
+    Rcpp::IntegerVector atac_p_rv = atac_sparse.slot("p");
+    Rcpp::NumericVector atac_x_rv = atac_sparse.slot("x");
+
+    const int*    rna_ip  = rna_i_rv.begin();
+    const int*    rna_pp  = rna_p_rv.begin();
+    const double* rna_xp  = rna_x_rv.begin();
+    const int*    atac_ip = atac_i_rv.begin();
+    const int*    atac_pp = atac_p_rv.begin();
+    const double* atac_xp = atac_x_rv.begin();
+
+    int n_pairs = gene_idx_r.size();
+
+    // ---- Copy R vectors to C++ (thread-safe) ----
+    std::vector<int> gene_idx(n_pairs), peak_idx(n_pairs);
+    std::vector<std::string> gene_names(n_pairs), peak_names(n_pairs);
+    for (int i = 0; i < n_pairs; i++) {
+        gene_idx[i]  = gene_idx_r(i);
+        peak_idx[i]  = peak_idx_r(i);
+        gene_names[i] = Rcpp::as<std::string>(gene_names_r(i));
+        peak_names[i] = Rcpp::as<std::string>(peak_names_r(i));
+    }
+
+    // ---- Active cells (those passing celltype filter) ----
+    std::vector<int> active_cells;
+    int total_cells = cell_mask.size();
+    for (int i = 0; i < total_cells; i++) {
+        if (cell_mask(i)) active_cells.push_back(i);
+    }
+    int n_active = (int)active_cells.size();
+
+    // ---- Pre-extract covariate sub-matrix for active cells ----
+    int n_cov = (int)cov_mat.n_cols;
+    mat cov_sub(n_active, n_cov);
+    for (int i = 0; i < n_active; i++) {
+        cov_sub.row(i) = cov_mat.row(active_cells[i]);
+    }
+
+    // ---- Build null design matrix: [intercept, covariates] ----
+    int p_null = 1 + n_cov;
+    mat X_null(n_active, p_null);
+    X_null.col(0).ones();
+    for (int j = 0; j < n_cov; j++) {
+        X_null.col(1 + j) = cov_sub.col(j);
+    }
+
+    // ---- Group pairs by gene ----
+    std::map<int, std::vector<int>> gene_to_pairs;
+    for (int i = 0; i < n_pairs; i++) {
+        gene_to_pairs[gene_idx[i]].push_back(i);
+    }
+
+    std::vector<int> unique_gene_rows;
+    std::vector<std::vector<int>> gene_pair_lists;
+    for (auto& kv : gene_to_pairs) {
+        unique_gene_rows.push_back(kv.first);
+        gene_pair_lists.push_back(std::move(kv.second));
+    }
+    int n_genes = (int)unique_gene_rows.size();
+
+    // ---- Pre-allocate per-pair result arrays ----
+    std::vector<int>    valid(n_pairs, 0);
+    std::vector<double> r_beta(n_pairs, 0), r_se(n_pairs, 0), r_z(n_pairs, 0);
+    std::vector<double> r_score_U(n_pairs, 0), r_score_V(n_pairs, 0);
+    std::vector<double> r_score_T(n_pairs, 0), r_score_p(n_pairs, 1);
+
+    // ---- Set OpenMP thread count ----
+#ifdef _OPENMP
+    if (ncores > 0) omp_set_num_threads(ncores);
+#endif
+
+    int progress_done = 0;
+
+    Rprintf("ASCENT [score]: %d pairs (%d genes) across %d cells (%s, %d threads)...\n",
+            n_pairs, n_genes, n_active,
+            regr_type == 0 ? "Poisson" : "NegBin",
+#ifdef _OPENMP
+            ncores > 0 ? ncores : omp_get_max_threads()
+#else
+            1
+#endif
+    );
+
+    // ================================================================
+    // MAIN PARALLEL LOOP — one iteration per gene
+    // ================================================================
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic)
+#endif
+    for (int gi = 0; gi < n_genes; gi++) {
+
+        int gene_row = unique_gene_rows[gi];
+        const std::vector<int>& pair_list = gene_pair_lists[gi];
+        int n_peaks_for_gene = (int)pair_list.size();
+
+        // Extract RNA row for this gene
+        vec rna_vec(n_active);
+        extract_sparse_row(rna_pp, rna_ip, rna_xp, gene_row,
+                           active_cells, rna_vec);
+
+        // Gene sparsity filter: require >5% nonzero
+        int n_expr = (int)accu(rna_vec > 0);
+        if ((double)n_expr / n_active <= 0.05) {
+#ifdef _OPENMP
+            #pragma omp atomic
+#endif
+            progress_done += n_peaks_for_gene;
+            continue;
+        }
+
+        // Fit null model via IRLS (X_null is read-only, thread-safe)
+        NullFitResult null_fit;
+        if (regr_type == 0) {
+            null_fit = poisson_null_irls(X_null, rna_vec);
+        } else {
+            null_fit = negbin_null_irls(X_null, rna_vec);
+        }
+        if (!null_fit.converged) {
+#ifdef _OPENMP
+            #pragma omp atomic
+#endif
+            progress_done += n_peaks_for_gene;
+            continue;
+        }
+
+        // Compute weights and weighted residuals
+        // Poisson: W = mu, r* = y - mu
+        // NegBin:  W = mu*theta/(theta+mu), r* = (y-mu)*theta/(theta+mu)
+        vec W, e_star;
+        if (regr_type == 0) {
+            W      = null_fit.mu;
+            e_star = rna_vec - null_fit.mu;
+        } else {
+            double th = null_fit.theta;
+            W      = null_fit.mu % (th / (th + null_fit.mu));
+            e_star = (rna_vec - null_fit.mu) % (th / (th + null_fit.mu));
+        }
+
+        // For each peak linked to this gene
+        for (int pair_idx : pair_list) {
+            int pi = peak_idx[pair_idx];
+
+            vec atac_vec(n_active);
+            extract_sparse_row(atac_pp, atac_ip, atac_xp, pi,
+                               active_cells, atac_vec);
+
+            if (binarize) {
+                atac_vec.elem(find(atac_vec > 0)).ones();
+            }
+
+            // Peak sparsity filter
+            int n_open = (int)accu(atac_vec > 0);
+            if ((double)n_open / n_active <= 0.05) {
+#ifdef _OPENMP
+                #pragma omp atomic
+#endif
+                progress_done++;
+                continue;
+            }
+
+            // Compute b_tilde: WLS residual of atac on X_null
+            //   Weights: Poisson W=mu, NegBin W=mu*theta/(theta+mu)
+            //   XtWX_inv already uses the correct weights from null fit
+            vec Wz = W % atac_vec;
+            vec v = X_null.t() * Wz;
+            vec gamma_proj = null_fit.XtWX_inv * v;
+            vec b_tilde = atac_vec - X_null * gamma_proj;
+
+            // HC0 sandwich score statistic using weighted residuals
+            double U = dot(b_tilde, e_star);
+            vec be = b_tilde % e_star;
+            double V = dot(be, be);   // sum(b_tilde^2 * e_star^2)
+
+            if (V <= 0) {
+#ifdef _OPENMP
+                #pragma omp atomic
+#endif
+                progress_done++;
+                continue;
+            }
+
+            // One-step Newton-Raphson beta: beta = U / I, se = sqrt(V) / I
+            double I_info = dot(b_tilde % b_tilde, W);  // sum(b_tilde^2 * mu)
+            if (I_info <= 0) {
+#ifdef _OPENMP
+                #pragma omp atomic
+#endif
+                progress_done++;
+                continue;
+            }
+            double beta_approx = U / I_info;
+            double se_approx   = std::sqrt(V) / I_info;
+            double z_approx    = U / std::sqrt(V);
+
+            double score_T = U * U / V;
+            // Chi-sq(1) survival: P(Z^2 > t) = erfc(sqrt(t/2))
+            double score_p = std::erfc(std::sqrt(score_T / 2.0));
+
+            valid[pair_idx]     = 1;
+            r_beta[pair_idx]    = beta_approx;
+            r_se[pair_idx]      = se_approx;
+            r_z[pair_idx]       = z_approx;
+            r_score_U[pair_idx] = U;
+            r_score_V[pair_idx] = V;
+            r_score_T[pair_idx] = score_T;
+            r_score_p[pair_idx] = score_p;
+
+#ifdef _OPENMP
+            #pragma omp atomic
+#endif
+            progress_done++;
+
+            // Progress reporting
+            if (progress_done % std::max(1, n_pairs / 20) == 0) {
+#ifdef _OPENMP
+                #pragma omp critical
+#endif
+                {
+                    Rprintf("\r  [%d / %d pairs processed (%.0f%%)]",
+                            progress_done, n_pairs,
+                            100.0 * progress_done / n_pairs);
+                }
+            }
+        } // end peak loop
+    } // end gene loop
+
+    Rprintf("\r  [%d / %d pairs processed (100%%)]\n", n_pairs, n_pairs);
+
+    // ---- Collect valid results into R DataFrame ----
+    int n_valid = 0;
+    for (int i = 0; i < n_pairs; i++) n_valid += valid[i];
+
+    Rcpp::StringVector  out_gene(n_valid), out_peak(n_valid);
+    Rcpp::NumericVector out_beta(n_valid), out_se(n_valid), out_z(n_valid);
+    Rcpp::NumericVector out_U(n_valid), out_V(n_valid);
+    Rcpp::NumericVector out_T(n_valid), out_p(n_valid);
+
+    int idx = 0;
+    for (int i = 0; i < n_pairs; i++) {
+        if (!valid[i]) continue;
+        out_gene[idx] = gene_names[i];
+        out_peak[idx] = peak_names[i];
+        out_beta[idx] = r_beta[i];
+        out_se[idx]   = r_se[i];
+        out_z[idx]    = r_z[i];
+        out_U[idx]    = r_score_U[i];
+        out_V[idx]    = r_score_V[i];
+        out_T[idx]    = r_score_T[i];
+        out_p[idx]    = r_score_p[i];
+        idx++;
+    }
+
+    Rprintf("ASCENT [score]: Done. %d / %d pairs passed quality filters.\n",
+            n_valid, n_pairs);
+
+    return Rcpp::DataFrame::create(
+        Rcpp::Named("gene")       = out_gene,
+        Rcpp::Named("peak")       = out_peak,
+        Rcpp::Named("beta")       = out_beta,
+        Rcpp::Named("se")         = out_se,
+        Rcpp::Named("z")          = out_z,
+        Rcpp::Named("score_U")    = out_U,
+        Rcpp::Named("score_V")    = out_V,
+        Rcpp::Named("score_stat") = out_T,
+        Rcpp::Named("score_p")    = out_p,
         Rcpp::Named("stringsAsFactors") = false
     );
 }

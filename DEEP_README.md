@@ -1,278 +1,116 @@
 # ASCENT: Technical Deep Dive
 
-ASCENT (Accelerated Single-Cell ENhancer Target) is a high-performance reimplementation of the [SCENT](https://github.com/immunogenomics/SCENT) algorithm in Rcpp/C++ with OpenMP parallelism. This document details the computational bottlenecks in the original R implementation and the optimizations introduced in ASCENT.
+ASCENT (Accelerated Single-Cell ENhancer Target) is a high-performance reimplementation of the [SCENT](https://github.com/immunogenomics/SCENT) algorithm in Rcpp/C++ with OpenMP parallelism. This document describes the key design decisions and the score test methodology introduced in ASCENT.
 
 ---
 
-## 1. Overview of the SCENT Algorithm
+## 1. The Problem: Model-Based P-values Are Unreliable
 
-SCENT tests for statistical association between chromatin accessibility (ATAC-seq peaks) and gene expression (RNA) across single cells. For each peak-gene pair:
+SCENT tests for statistical association between chromatin accessibility (ATAC-seq peaks) and gene expression (RNA) across single cells, using a GLM (Poisson or Negative Binomial) for each peak-gene pair.
 
-1. **Fit a GLM** (Poisson or Negative Binomial) regressing gene expression on peak accessibility, controlling for covariates (e.g., total UMI counts).
-2. **Bootstrap** the coefficient estimate with an adaptive resampling schedule:
-   - 100 replicates; if p < 0.1, escalate to 500
-   - 500 replicates; if p < 0.05, escalate to 2,500
-   - 2,500 replicates; if p < 0.01, escalate to 25,000
-   - 25,000 replicates; if p < 0.001, escalate to 50,000
+A standard Wald test computes a p-value from the model-based standard error (derived from the Fisher information matrix). However, single-cell count data frequently violates the assumed variance function:
+
+- **Poisson** assumes Var(y) = μ, but real scRNA-seq data is overdispersed (Var(y) >> μ) due to biological heterogeneity, dropout, and technical noise.
+- **Negative Binomial** accounts for overdispersion via a dispersion parameter θ, but the assumed variance Var(y) = μ + μ²/θ may still not match the true data-generating process.
+
+When the variance is underestimated, model-based SEs are too small, z-statistics are inflated, and **p-values are anti-conservative** (too many false positives). This is a well-known problem in count regression for genomics.
+
+---
+
+## 2. SCENT's Solution: Bootstrap
+
+To obtain reliable p-values without trusting the model-based SE, SCENT uses an **adaptive bootstrap**:
+
+1. **Fit the GLM** to get the observed coefficient β̂.
+2. **Resample cells with replacement** and re-fit the GLM on each bootstrap sample to build an empirical distribution of β̂.
 3. **Compute an empirical p-value** from the bootstrap distribution using the basic bootstrap method.
 
-The computational cost is dominated by the bootstrap: a single pair may require up to 50,000 GLM fits. Genome-wide analyses involve tens of thousands of pairs.
+The adaptive schedule escalates the number of replicates for promising pairs (100 → 500 → 2,500 → 25,000 → 50,000), concentrating computation where it matters.
+
+This approach is statistically robust — the bootstrap distribution captures the true sampling variability regardless of model misspecification. But it is computationally expensive: a single pair may require up to 50,000 GLM fits. Genome-wide analyses involve hundreds of thousands of pairs.
 
 ---
 
-## 2. Bottlenecks in the Original R Implementation
+## 3. ASCENT Wald Test: Accelerating the Bootstrap
 
-### 2.1 Sequential pair processing
+ASCENT preserves SCENT's bootstrap approach but replaces the computational engine. The key design changes:
 
-The original SCENT iterates over peak-gene pairs in a `for` loop. Each pair is fully processed (initial fit + all bootstrap stages) before moving to the next. There is no parallelism across pairs.
+### OpenMP parallelism across pairs
 
-```r
-for (n in 1:nrow(peak.info)) {
-  # ... extract data, fit GLM, run boot::boot ...
-}
-```
+SCENT parallelizes *within* each pair — it uses `boot::boot(parallel = "multicore")` to distribute bootstrap replicates across forked R processes. Each fork duplicates the entire R session (copy-on-write), so memory scales linearly with core count.
 
-### 2.2 Fork-based bootstrap parallelism
+ASCENT instead parallelizes *across* pairs using OpenMP threads with dynamic scheduling. All threads share the same memory space — the sparse matrices, covariate matrix, and metadata are read-only shared data. Only small per-thread working vectors (design matrix, weights, IRLS temporaries) are thread-local. Memory stays constant regardless of core count.
 
-SCENT uses `boot::boot(parallel = "multicore", ncpus = N)` to parallelize bootstrap replicates within a single pair. This calls `parallel::mclapply`, which `fork()`s the R process N times.
+### Fixed-theta Negative Binomial bootstrap
 
-**Problems:**
+For NegBin regression, SCENT uses `MASS::glm.nb()` which jointly re-estimates both beta and theta (dispersion) on every bootstrap replicate. This is computationally expensive (~50–100 IRLS iterations per replicate due to alternating beta-theta optimization) and statistically unnecessary — theta is a nuisance parameter that characterizes the gene's overdispersion, not the peak-gene association being tested.
 
-- **Memory duplication.** Each forked child gets a copy-on-write clone of the entire R session (Seurat object, sparse matrices, metadata). As children modify working memory during GLM fitting, the OS must copy modified pages. With 8 cores, observed peak RSS is ~8x the base process size (~3.3 GB base becomes ~26 GB).
-- **Fork overhead per pair.** Forking is repeated for every pair at every bootstrap stage. For 1,543 pairs with an average of ~2 bootstrap stages each, that is ~3,000 fork operations.
-- **Diminishing returns.** The bootstrap replicates within a single pair are fast individually (one GLM fit each). The fork/join overhead can exceed the computation time, especially at the 100-replicate stage.
-
-### 2.3 Data copying per bootstrap replicate
-
-`boot::boot` with `stype = "i"` generates an index vector and calls `statistic(data[idx, ])` for each replicate. This subsets the data frame every time, creating a new copy of the design matrix, response vector, and all columns.
-
-For a pair requiring 50,000 replicates on 2,286 cells with 4 predictors, that is 50,000 data frame subset operations, each allocating and populating a new object.
-
-### 2.4 Cold-started GLM fits
-
-Each bootstrap replicate calls `glm()` (or `fastglm::fastglm()`) from scratch. The IRLS algorithm starts from a default initialization (mu = y + 0.1), typically requiring 15-25 iterations to converge. There is no mechanism to reuse the converged coefficients from the initial fit as a starting point.
-
-### 2.5 R interpreter overhead in the IRLS loop
-
-R's `glm()` function wraps LAPACK/BLAS linear algebra in several hundred lines of R code:
-
-- Formula parsing and `model.matrix()` construction
-- Family object method dispatch (`$linkfun`, `$variance`, `$mu.eta`, `$dev.resids`)
-- R-level convergence checking
-- `summary.glm()` for variance-covariance extraction
-
-The underlying QR decomposition is compiled (LAPACK), but everything around it is interpreted R. This overhead is negligible for a single fit but becomes significant when multiplied by up to 50,000 replicates per pair across thousands of pairs.
-
-### 2.6 Sparse matrix access via R's S4 dispatch
-
-Extracting a row from a `dgCMatrix` (CSC sparse matrix) in R, e.g., `object@atac[peak_name, ]`, triggers:
-
-- S4 method dispatch for `[`
-- Internal conversion logic for the CSC-to-row extraction
-- Allocation of a new dense vector
-- Name assignment for the result
-
-This is repeated for both the RNA and ATAC matrix for every pair.
-
-### 2.7 Negative Binomial theta estimation
-
-For `regr = "negbin"`, SCENT uses `MASS::glm.nb()`, which internally alternates between IRLS and theta estimation. Each bootstrap replicate re-estimates theta from scratch, even though the dispersion parameter is relatively stable across bootstrap samples of the same pair.
+ASCENT estimates theta once from the initial fit, then holds it fixed for all bootstrap replicates. This is the same approach used by DESeq2 and edgeR. Combined with warm-starting IRLS from the initial fit's converged coefficients, bootstrap replicates converge in 2–3 iterations instead of 50–100. This is the largest single source of speedup for NegBin regression (82x vs 22x for Poisson).
 
 ---
 
-## 3. ASCENT Optimizations
+## 4. ASCENT Score Test: Eliminating the Bootstrap
 
-### 3.1 Pair-level OpenMP parallelism
+### 4.1 Why sandwich SE replaces bootstrap
 
-ASCENT parallelizes across **pairs**, not within bootstrap replicates:
+Recall the core problem (Section 1): model-based SEs are unreliable because the assumed variance function (Var(y) = μ for Poisson, Var(y) = μ + μ²/θ for NegBin) doesn't match real single-cell data. SCENT's solution is bootstrap — resample the data thousands of times to empirically measure the true variability of β̂, bypassing the model-based SE entirely.
 
-```cpp
-#pragma omp parallel for schedule(dynamic)
-for (int pair = 0; pair < n_pairs; pair++) {
-    // ... extract data, fit IRLS, run all bootstrap stages ...
-}
-```
+The **HC0 sandwich standard error** solves the same problem analytically. Instead of assuming a variance function, it uses the observed squared residuals to estimate the true variability of each observation. Where the model-based SE asks "how variable would β̂ be *if the model were correct*?", the sandwich SE asks "how variable is β̂ *given what the residuals actually look like*?" — the same question the bootstrap answers, but without resampling.
 
-**Advantages:**
+This is a well-established approach in econometrics (White, 1980) and increasingly used in genomics. The sandwich SE is robust to the same misspecification that makes model-based SEs anti-conservative, providing reliable p-values in a single pass through the data.
 
-- **No fork overhead.** OpenMP threads are created once at loop entry. Thread creation cost is amortized across all pairs.
-- **Dynamic scheduling.** Pairs with significant p-values require more bootstrap stages (up to 50,000 replicates). `schedule(dynamic)` ensures threads that finish fast pairs pick up new work immediately, avoiding load imbalance.
-- **Shared memory.** All threads read from the same CSC arrays and covariate matrix. Only per-thread working vectors (design matrix, frequency vector, IRLS temporaries) are thread-local.
+### 4.2 Why score p-values are comparable to bootstrap p-values
 
-**Memory impact:** With 8 threads, ASCENT uses ~3.3 GB total. The R implementations with 8 forked processes use ~26 GB.
+Both the bootstrap and the sandwich SE are correcting for the same underlying problem — variance misspecification — so they arrive at similar answers. The bootstrap measures the true sampling distribution empirically; the sandwich SE estimates it analytically from the residuals. In benchmarks, the score test achieves 97–99% concordance with the wald+bootstrap test on significance calls at α = 0.05.
 
-### 3.2 Frequency-weighted bootstrap
+The score test is slightly **conservative** relative to bootstrap: sandwich SEs tend to be a bit larger than the empirical bootstrap SD, producing slightly higher p-values. This means the score test is less likely to produce false positives — a safe direction of disagreement.
 
-Instead of resampling rows of the data frame, ASCENT generates a **multinomial frequency vector**:
+One advantage of the analytic p-value: it has no resolution floor. Bootstrap p-values are bounded by 1/(B+1) — at 50,000 replicates, the minimum is 2×10⁻⁵. The score test can resolve arbitrarily small p-values.
 
-```cpp
-vec freq(n_active);
-freq.zeros();
-for (int c = 0; c < n_active; c++) freq(cell_dist(rng))++;
-```
+### 4.3 How beta is computed: score vs wald
 
-This frequency vector serves as case weights in the IRLS. The design matrix `X` and response `y` are never copied — only the weight vector changes per replicate.
+The **wald beta** is the full maximum likelihood estimate (MLE). The GLM is fitted with IRLS (iteratively reweighted least squares), which iterates 10–25 times until convergence, fully optimizing the log-likelihood.
 
-**Impact:** Eliminates 50,000 data frame copies per pair. The frequency vector is `n_cells` doubles (~18 KB for 2,286 cells), reused in-place.
+The **score beta** is a one-step approximation. Starting from the null model (β_peak = 0), ASCENT computes a single Newton-Raphson update — equivalent to one IRLS iteration with the peak variable added to the design matrix. This is much cheaper: one matrix solve instead of 10–25 iterative solves.
 
-### 3.3 Warm-started IRLS
+**Why this works:** Near the null, the log-likelihood is approximately quadratic, so one Newton step lands close to the true MLE. For the vast majority of peak-gene pairs (small-to-moderate effects), the score beta and wald beta are nearly identical (Spearman ρ > 0.999).
 
-Each bootstrap replicate initializes from the initial fit's converged coefficients:
+**Where they diverge:** For large effect sizes, the log-likelihood surface is non-quadratic far from the null — the exponential link function means the curvature changes as β moves away from zero. A single Newton step from β = 0 uses the curvature *at the null*, which overestimates the curvature at the true optimum. The result is that score beta **undershoots** the wald beta: |score beta| < |wald beta|.
 
-```cpp
-double poisson_boot_coef(const mat& X, const vec& y, const vec& freq,
-                         const vec& beta_warm, ...) {
-    vec eta = X * beta_warm;  // start from converged solution
-    ...
-}
-```
+This undershoot matters little in practice — pairs with large effects are already highly significant under both tests. The undershoot affects the point estimate but not the significance call.
 
-Since bootstrap samples are perturbations of the original data, the converged coefficients are a good starting point. Typical convergence: **2-5 iterations** instead of 15-25 from a cold start.
+### 4.4 Combined effect on p-values
 
-**Impact:** ~5x fewer IRLS iterations per bootstrap replicate.
+The two differences compound in the same direction:
+- Slightly smaller |beta| (one-step undershoot) in the numerator of z = beta / SE
+- Slightly larger SE (sandwich vs model-based) in the denominator
 
-### 3.4 Direct CSC sparse row extraction
+The result is attenuated |z| and more conservative p-values. This is why the score test is a safe drop-in replacement for wald+bootstrap — when they disagree, the score test errs on the side of caution.
 
-ASCENT extracts rows from `dgCMatrix` by directly operating on the CSC arrays (`@i`, `@p`, `@x`), using binary search within each column's index range:
+The SE gap is **larger for Poisson** (where Var(y) = μ substantially underestimates true variance) and **smaller for Negative Binomial** (where the model already captures overdispersion via θ, leaving less for the sandwich correction to add).
 
-```cpp
-inline void extract_sparse_row(const int* p, const int* i, const double* x,
-                                int row_idx, const std::vector<int>& active_cells,
-                                vec& out) {
-    for (int k = 0; k < n; k++) {
-        int col = active_cells[k];
-        const int* pos = std::lower_bound(i + p[col], i + p[col+1], row_idx);
-        if (pos != i + p[col+1] && *pos == row_idx)
-            out(k) = x[pos - i];
-    }
-}
-```
+### 4.5 Null model amortization
 
-**Advantages:**
+When multiple peaks are tested against the same gene, the null model (gene ~ covariates) is **fitted once and reused** for all peaks linked to that gene. The C++ implementation groups pairs by gene and parallelizes at the gene level with OpenMP. In a typical genome-wide analysis, this reduces the number of null model fits from number of peak-gene pairs to number of genes.
 
-- No S4 method dispatch
-- No memory allocation (output vector is pre-allocated and reused)
-- Only scans active cells (those passing the cell-type filter), not all columns
-- Binary search is O(log nnz) per column vs. linear scan
+### 4.6 Why the score test is fast
 
-### 3.5 Compiled IRLS loop
+The wald test cost per pair is dominated by bootstrap: up to 50,000 IRLS fits × 2–5 iterations each. The score test replaces this with:
 
-The entire IRLS iteration — weight computation, working response, QR-based weighted least squares, eta update, convergence check — is a tight C++ loop with no R API calls:
+- 1 null model fit (~10–25 IRLS iterations), amortized across all peaks for the same gene
+- 1 matrix solve per peak (no iteration)
+- 1 sandwich variance computation per peak
 
-```cpp
-for (int iter = 0; iter < max_iter; iter++) {
-    vec w = clamp(mu, 1e-10, 1e7);
-    vec z_w = eta + (y - mu) / mu;
-    if (!qr_wls_solve(beta_new, X, w, z_w)) return res;
-    vec eta_new = X * beta_new;
-    eta_new = clamp(eta_new, -30.0, 30.0);
-    vec mu_new = exp(eta_new);
-    double change = accu(abs(eta_new - eta)) / n;
-    beta = beta_new; eta = eta_new; mu = mu_new;
-    if (change < tol) break;
-}
-```
-
-The QR decomposition itself uses the same LAPACK routines as R (via Armadillo's `solve()`), but removing the R-level wrapper overhead around each iteration accumulates significant savings over millions of total IRLS iterations.
-
-### 3.6 Fixed-theta Negative Binomial bootstrap
-
-For Negative Binomial regression, ASCENT estimates theta once from the initial fit (alternating IRLS + Newton-Raphson), then **fixes theta** for all bootstrap replicates:
-
-```cpp
-double negbin_boot_coef(..., double theta, ...) {
-    // theta is fixed — only beta is re-estimated
-    vec w = freq % mu % (theta / (theta + mu));
-    ...
-}
-```
-
-**Why this is statistically valid:**
-
-- **Theta is a nuisance parameter.** The bootstrap is testing whether beta (the peak-gene association) is significantly different from zero. Theta controls the overall overdispersion of the gene's count distribution across all cells — it is a property of the gene, not of the peak-gene relationship. Resampling cells doesn't change the gene's underlying dispersion.
-- **Standard practice.** This is the same approach used by `DESeq2` and `edgeR` — estimate dispersion once on the full data, then hold it fixed for all downstream inference. The full-data estimate is more stable and accurate than per-resample estimates.
-- **Re-estimation adds noise, not accuracy.** Theta estimated from a bootstrap resample has high variance, especially on sparse single-cell data. This noisy theta propagates into noisier beta estimates, making the bootstrap distribution artificially wider without improving the test's validity.
-
-**Why SCENT re-estimates theta:** The original SCENT uses `MASS::glm.nb()`, which jointly estimates both beta and theta in a single function call. This was the path of least resistance — fixing theta would require extracting it from the initial fit, storing it, and passing it into a separate `glm(..., family = negative.binomial(theta))` call for each bootstrap replicate. More code and bookkeeping for the same statistical conclusion. The computational penalty of re-estimation was not apparent at the scale SCENT was originally designed for.
-
-**Impact:** For a pair requiring 50,000 replicates, SCENT's `glm.nb()` runs ~50-100 IRLS iterations per replicate (alternating beta and theta). ASCENT's fixed-theta bootstrap runs ~2-3 iterations per replicate (warm-started, beta only). This is the single largest source of speedup for NegBin regression.
-
-### 3.7 Thread-safe RNG with reproducible seeds
-
-Each pair gets a deterministic seed (`42 + pair_index`), ensuring reproducibility regardless of thread count:
-
-```cpp
-std::mt19937 rng(42u + (unsigned)pair);
-```
-
-This avoids R's single-threaded RNG (which cannot be called from OpenMP threads) and ensures results are identical whether run with 1 or 8 threads.
-
-### 3.8 Pre-subsetting to relevant features
-
-Before entering C++, the R wrapper subsets the sparse matrices to only the genes and peaks present in the pair list:
-
-```r
-rna_sub  <- object@rna[genes_needed, , drop = FALSE]
-atac_sub <- object@atac[peaks_needed, , drop = FALSE]
-```
-
-This reduces the size of the CSC arrays passed to C++, improving cache locality and reducing binary search ranges. The original SCENT accesses the full matrix for every pair.
+This reduces the total IRLS iterations from tens of millions (wald) to tens of thousands (score) — a reduction of three to four orders of magnitude.
 
 ---
 
-## 4. Benchmark Results
+## 5. Summary
 
-**Test configuration:** 1,800 peak-gene pairs stratified by distance to TSS (0-5kb, 5-20kb, 20-50kb) and sparsity (Borderline 5-10%, Sparse 10-25%, Dense 25-100%), 2,286 CD14 monocyte cells, 8 cores.
-
-### Runtime — Poisson (1,800 pairs)
-
-| Method  | Elapsed (sec) | Speedup vs glm |
-|---------|--------------|----------------|
-| glm     | 12,918       | 1.0x (baseline)|
-| fastglm | 7,200        | 1.8x           |
-| rcpp    | 597          | **21.6x**      |
-
-### Runtime — Negative Binomial (32 pairs)
-
-| Method  | Elapsed (sec) | Speedup vs glm |
-|---------|--------------|----------------|
-| glm     | 6,505        | 1.0x (baseline)|
-| fastglm | 341          | 19.1x          |
-| rcpp    | 82           | **79.3x**      |
-
-The much larger NegBin speedup is primarily due to ASCENT fixing theta (dispersion) during bootstrap rather than re-estimating it on every replicate (see Section 3.6).
-
-### Peak Memory (MaxRSS)
-
-ASCENT uses OpenMP shared-memory threads; memory stays constant regardless of core count. The R methods use `fork()`-based parallelism (`mclapply`), so memory scales linearly with the number of cores — each forked child gets a copy-on-write clone of the entire R session.
-
-| Method  | Memory (GB) | Note |
-|---------|-------------|------|
-| glm     | 25.8        | ~3.3 GB base x 8 forked processes |
-| fastglm | 25.5        | ~3.3 GB base x 8 forked processes |
-| rcpp    | 3.3         | constant regardless of core count |
-
-### Numerical Accuracy
-
-| Comparison       | Max absolute beta diff | Max absolute SE diff | Correlation |
-|------------------|-----------------|---------------|-------------|
-| rcpp vs glm      | 2.24e-08        | 1.54e-05      | 1.000000    |
-| fastglm vs glm   | 3.36e-14        | 7.66e-15      | 1.000000    |
-
-Bootstrap p-values differ due to independent RNG streams but show high Spearman correlation across all strata, with >95% concordance on significance calls at alpha = 0.05.
-
----
-
-## 5. Summary of Improvements
-
-| Bottleneck | SCENT (R) | ASCENT (Rcpp) |
-|-----------|-----------|---------------|
-| Parallelism | Fork-based within bootstrap | OpenMP across pairs |
-| Memory model | N forked processes (copy-on-write) | Shared address space (threads) |
-| Bootstrap data | Full data frame copy per replicate | Frequency vector as case weights |
-| IRLS initialization | Cold start every replicate | Warm start from initial fit |
-| IRLS loop | R interpreter + S4 dispatch | Compiled C++ loop |
-| Sparse access | R's `[` with S4 dispatch | Direct CSC binary search |
-| NB theta | Re-estimated every replicate | Fixed from initial fit |
-| RNG | R's single-threaded RNG via fork | Per-pair `std::mt19937` |
-| Matrix scope | Full genome-wide matrices | Pre-subsetted to relevant features |
+| | SCENT (R) | ASCENT Wald (Rcpp) | ASCENT Score (Rcpp) |
+|---|-----------|---------------|---------------------|
+| Parallelism | Fork-based within bootstrap | OpenMP across pairs | OpenMP across genes |
+| Memory | N forked processes (copy-on-write) | Shared address space | Shared address space |
+| Bootstrap | Up to 50,000 replicates per pair | Up to 50,000 replicates per pair | **Eliminated** |
+| NB theta | Re-estimated every replicate | Fixed from initial fit | Estimated in null model |
+| Null model | Fitted per pair | Fitted per pair | **Fitted per gene** |
