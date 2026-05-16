@@ -1,3 +1,6 @@
+# Temporary working directories
+temp/
+
 # Benchmark outputs
 benchmark_t1_output/
 benchmark_t2_output/

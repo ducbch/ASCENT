@@ -545,7 +545,8 @@ Rcpp::DataFrame ascent_process_pairs(
     Rcpp::LogicalVector cell_mask,
     bool binarize,
     int regr_type,   // 0 = poisson, 1 = negbin
-    int ncores)
+    int ncores,
+    bool skip_bootstrap = false)
 {
     // ---- Extract CSC components from dgCMatrix ----
     Rcpp::IntegerVector rna_i_rv  = rna_sparse.slot("i");
@@ -680,11 +681,14 @@ Rcpp::DataFrame ascent_process_pairs(
         }
 
         // ---- Iterative bootstrap (adaptive) ----
+        double boot_p_val = NA_REAL;
+
+        if (!skip_bootstrap) {
         // Thread-local RNG seeded by pair index for reproducibility
         std::mt19937 rng(42u + (unsigned)pair);
         std::uniform_int_distribution<int> cell_dist(0, n_active - 1);
 
-        double boot_p_val = 1.0;
+        boot_p_val = 1.0;
 
         // Always run stage 0
         {
@@ -729,6 +733,7 @@ Rcpp::DataFrame ascent_process_pairs(
             if (!boot_coefs.empty())
                 boot_p_val = basic_p_cpp(fit.coef, boot_coefs);
         }
+        } // end if (!skip_bootstrap)
 
         // ---- Store results ----
         valid[pair]    = 1;

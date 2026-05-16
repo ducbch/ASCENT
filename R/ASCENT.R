@@ -179,12 +179,12 @@ basic_p <- function(obs, boot, null = 0) {
 #'
 #' @return Data frame of results (gene, peak, beta, se, z, p, boot_basic_p).
 #' @noRd
-.ASCENT_algorithm_fastglm <- function(object, celltype, ncores, regr, bin) {
+.ASCENT_algorithm_fastglm <- function(object, celltype, ncores, regr, bin, bootstrap = TRUE) {
   if (!requireNamespace("fastglm", quietly = TRUE))
     stop("Install fastglm: install.packages('fastglm')")
   if (regr == "negbin" && !requireNamespace("MASS", quietly = TRUE))
     stop("Install MASS for negbin: install.packages('MASS')")
-  if (!requireNamespace("boot", quietly = TRUE))
+  if (bootstrap && !requireNamespace("boot", quietly = TRUE))
     stop("Install boot: install.packages('boot')")
 
   res <- data.frame()
@@ -251,28 +251,32 @@ basic_p <- function(obs, boot, null = 0) {
     coefs  <- c(coef_atac, se_atac, z_atac, p_atac)
 
     # ---- Iterative bootstrap (same schedule as original SCENT) ----
-    boot_args <- c(list(data = df2, statistic = assoc_fn, stype = "i",
-                        parallel = "multicore", ncpus = ncores),
-                   boot_extra)
+    if (bootstrap) {
+      boot_args <- c(list(data = df2, statistic = assoc_fn, stype = "i",
+                          parallel = "multicore", ncpus = ncores),
+                     boot_extra)
 
-    bs <- do.call(boot::boot, c(boot_args, list(R = 100)))
-    p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      bs <- do.call(boot::boot, c(boot_args, list(R = 100)))
+      p0 <- basic_p(bs$t0[1], bs$t[, 1])
 
-    if (p0 < 0.1) {
-      bs <- do.call(boot::boot, c(boot_args, list(R = 500)))
-      p0 <- basic_p(bs$t0[1], bs$t[, 1])
-    }
-    if (p0 < 0.05) {
-      bs <- do.call(boot::boot, c(boot_args, list(R = 2500)))
-      p0 <- basic_p(bs$t0[1], bs$t[, 1])
-    }
-    if (p0 < 0.01) {
-      bs <- do.call(boot::boot, c(boot_args, list(R = 25000)))
-      p0 <- basic_p(bs$t0[1], bs$t[, 1])
-    }
-    if (p0 < 0.001) {
-      bs <- do.call(boot::boot, c(boot_args, list(R = 50000)))
-      p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      if (p0 < 0.1) {
+        bs <- do.call(boot::boot, c(boot_args, list(R = 500)))
+        p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      }
+      if (p0 < 0.05) {
+        bs <- do.call(boot::boot, c(boot_args, list(R = 2500)))
+        p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      }
+      if (p0 < 0.01) {
+        bs <- do.call(boot::boot, c(boot_args, list(R = 25000)))
+        p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      }
+      if (p0 < 0.001) {
+        bs <- do.call(boot::boot, c(boot_args, list(R = 50000)))
+        p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      }
+    } else {
+      p0 <- NA_real_
     }
 
     out <- data.frame(gene = gene, peak = this_peak,
@@ -348,10 +352,10 @@ basic_p <- function(obs, boot, null = 0) {
 #'
 #' @return Data frame of results (gene, peak, beta, se, z, p, boot_basic_p).
 #' @noRd
-.ASCENT_algorithm_glm <- function(object, celltype, ncores, regr, bin) {
+.ASCENT_algorithm_glm <- function(object, celltype, ncores, regr, bin, bootstrap = TRUE) {
   if (regr == "negbin" && !requireNamespace("MASS", quietly = TRUE))
     stop("Install MASS for negbin: install.packages('MASS')")
-  if (!requireNamespace("boot", quietly = TRUE))
+  if (bootstrap && !requireNamespace("boot", quietly = TRUE))
     stop("Install boot: install.packages('boot')")
 
   res <- data.frame()
@@ -400,31 +404,35 @@ basic_p <- function(obs, boot, null = 0) {
     coefs <- coefs_tbl["atac", ]  # Estimate, Std. Error, z value, Pr(>|z|)
 
     # ---- Iterative bootstrap (same schedule as original SCENT) ----
-    assoc_fn <- if (regr == "poisson") .assoc_poisson_glm else .assoc_negbin_glm
+    if (bootstrap) {
+      assoc_fn <- if (regr == "poisson") .assoc_poisson_glm else .assoc_negbin_glm
 
-    bs <- boot::boot(df2, assoc_fn, R = 100, formula = formula,
-                     stype = "i", parallel = "multicore", ncpus = ncores)
-    p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      bs <- boot::boot(df2, assoc_fn, R = 100, formula = formula,
+                       stype = "i", parallel = "multicore", ncpus = ncores)
+      p0 <- basic_p(bs$t0[1], bs$t[, 1])
 
-    if (p0 < 0.1) {
-      bs <- boot::boot(df2, assoc_fn, R = 500, formula = formula,
-                       stype = "i", parallel = "multicore", ncpus = ncores)
-      p0 <- basic_p(bs$t0[1], bs$t[, 1])
-    }
-    if (p0 < 0.05) {
-      bs <- boot::boot(df2, assoc_fn, R = 2500, formula = formula,
-                       stype = "i", parallel = "multicore", ncpus = ncores)
-      p0 <- basic_p(bs$t0[1], bs$t[, 1])
-    }
-    if (p0 < 0.01) {
-      bs <- boot::boot(df2, assoc_fn, R = 25000, formula = formula,
-                       stype = "i", parallel = "multicore", ncpus = ncores)
-      p0 <- basic_p(bs$t0[1], bs$t[, 1])
-    }
-    if (p0 < 0.001) {
-      bs <- boot::boot(df2, assoc_fn, R = 50000, formula = formula,
-                       stype = "i", parallel = "multicore", ncpus = ncores)
-      p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      if (p0 < 0.1) {
+        bs <- boot::boot(df2, assoc_fn, R = 500, formula = formula,
+                         stype = "i", parallel = "multicore", ncpus = ncores)
+        p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      }
+      if (p0 < 0.05) {
+        bs <- boot::boot(df2, assoc_fn, R = 2500, formula = formula,
+                         stype = "i", parallel = "multicore", ncpus = ncores)
+        p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      }
+      if (p0 < 0.01) {
+        bs <- boot::boot(df2, assoc_fn, R = 25000, formula = formula,
+                         stype = "i", parallel = "multicore", ncpus = ncores)
+        p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      }
+      if (p0 < 0.001) {
+        bs <- boot::boot(df2, assoc_fn, R = 50000, formula = formula,
+                         stype = "i", parallel = "multicore", ncpus = ncores)
+        p0 <- basic_p(bs$t0[1], bs$t[, 1])
+      }
+    } else {
+      p0 <- NA_real_
     }
 
     out <- data.frame(gene = gene, peak = this_peak,
@@ -740,12 +748,17 @@ CreateASCENTObj <- setClass(
 #'   }
 #' @param test Character. Testing strategy: \code{"wald"} (default) for
 #'   Wald test + adaptive bootstrap, or \code{"score"} for score test +
-#'   HC0 sandwich variance (no bootstrap, Poisson only).
+#'   HC0 sandwich variance (no bootstrap).
+#' @param bootstrap Logical. If \code{TRUE} (default), run adaptive bootstrap
+#'   to compute \code{boot_basic_p}. If \code{FALSE}, skip bootstrap entirely
+#'   (much faster) and return only the asymptotic Wald p-value. Ignored when
+#'   \code{test = "score"}.
 #'
 #' @return The input ASCENT object with the \code{@@ASCENT.result} slot
 #'   populated as a \code{data.frame}. For \code{test = "wald"}: columns
 #'   \code{gene}, \code{peak}, \code{beta}, \code{se}, \code{z}, \code{p},
-#'   \code{boot_basic_p}. For \code{test = "score"}: columns \code{gene},
+#'   \code{boot_basic_p} (NA when \code{bootstrap = FALSE}).
+#'   For \code{test = "score"}: columns \code{gene},
 #'   \code{peak}, \code{beta}, \code{se}, \code{z}, \code{score_U},
 #'   \code{score_V}, \code{score_stat}, \code{score_p}.
 #'
@@ -777,7 +790,8 @@ CreateASCENTObj <- setClass(
 #' @export
 ASCENT_algorithm <- function(object, celltype, ncores = 1L,
                              regr = "poisson", bin = TRUE,
-                             method = "rcpp", test = "wald") {
+                             method = "rcpp", test = "wald",
+                             bootstrap = TRUE) {
 
   # ---- Validate inputs ----
   stopifnot(inherits(object, "ASCENT"))
@@ -803,13 +817,13 @@ ASCENT_algorithm <- function(object, celltype, ncores = 1L,
   # ---- Wald test: R fallback paths ----
   if (test == "wald" && method %in% c("fastglm", "glm")) {
     message(sprintf(
-      "ASCENT [%s]: %d pairs | celltype='%s' | %s | %d bootstrap cores",
-      method, nrow(object@peak.info), celltype, regr, ncores
+      "ASCENT [%s]: %d pairs | celltype='%s' | %s | bootstrap=%s | %d cores",
+      method, nrow(object@peak.info), celltype, regr, bootstrap, ncores
     ))
     res <- if (method == "fastglm") {
-      .ASCENT_algorithm_fastglm(object, celltype, ncores, regr, bin)
+      .ASCENT_algorithm_fastglm(object, celltype, ncores, regr, bin, bootstrap)
     } else {
-      .ASCENT_algorithm_glm(object, celltype, ncores, regr, bin)
+      .ASCENT_algorithm_glm(object, celltype, ncores, regr, bin, bootstrap)
     }
     object@ASCENT.result <- res
     return(object)
@@ -895,7 +909,8 @@ ASCENT_algorithm <- function(object, celltype, ncores = 1L,
       cell_mask    = cell_mask,
       binarize     = bin,
       regr_type    = regr_int,
-      ncores       = as.integer(ncores)
+      ncores       = as.integer(ncores),
+      skip_bootstrap = !bootstrap
     )
   }
 

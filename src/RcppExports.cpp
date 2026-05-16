@@ -12,8 +12,8 @@ Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
 // ascent_process_pairs
-Rcpp::DataFrame ascent_process_pairs(Rcpp::S4 rna_sparse, Rcpp::S4 atac_sparse, Rcpp::IntegerVector gene_idx_r, Rcpp::IntegerVector peak_idx_r, Rcpp::StringVector gene_names_r, Rcpp::StringVector peak_names_r, arma::mat cov_mat, Rcpp::LogicalVector cell_mask, bool binarize, int regr_type, int ncores);
-RcppExport SEXP _ASCENT_ascent_process_pairs(SEXP rna_sparseSEXP, SEXP atac_sparseSEXP, SEXP gene_idx_rSEXP, SEXP peak_idx_rSEXP, SEXP gene_names_rSEXP, SEXP peak_names_rSEXP, SEXP cov_matSEXP, SEXP cell_maskSEXP, SEXP binarizeSEXP, SEXP regr_typeSEXP, SEXP ncoresSEXP) {
+Rcpp::DataFrame ascent_process_pairs(Rcpp::S4 rna_sparse, Rcpp::S4 atac_sparse, Rcpp::IntegerVector gene_idx_r, Rcpp::IntegerVector peak_idx_r, Rcpp::StringVector gene_names_r, Rcpp::StringVector peak_names_r, arma::mat cov_mat, Rcpp::LogicalVector cell_mask, bool binarize, int regr_type, int ncores, bool skip_bootstrap);
+RcppExport SEXP _ASCENT_ascent_process_pairs(SEXP rna_sparseSEXP, SEXP atac_sparseSEXP, SEXP gene_idx_rSEXP, SEXP peak_idx_rSEXP, SEXP gene_names_rSEXP, SEXP peak_names_rSEXP, SEXP cov_matSEXP, SEXP cell_maskSEXP, SEXP binarizeSEXP, SEXP regr_typeSEXP, SEXP ncoresSEXP, SEXP skip_bootstrapSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -28,7 +28,8 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< bool >::type binarize(binarizeSEXP);
     Rcpp::traits::input_parameter< int >::type regr_type(regr_typeSEXP);
     Rcpp::traits::input_parameter< int >::type ncores(ncoresSEXP);
-    rcpp_result_gen = Rcpp::wrap(ascent_process_pairs(rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores));
+    Rcpp::traits::input_parameter< bool >::type skip_bootstrap(skip_bootstrapSEXP);
+    rcpp_result_gen = Rcpp::wrap(ascent_process_pairs(rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores, skip_bootstrap));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -56,7 +57,7 @@ END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
-    {"_ASCENT_ascent_process_pairs", (DL_FUNC) &_ASCENT_ascent_process_pairs, 11},
+    {"_ASCENT_ascent_process_pairs", (DL_FUNC) &_ASCENT_ascent_process_pairs, 12},
     {"_ASCENT_ascent_score_pairs", (DL_FUNC) &_ASCENT_ascent_score_pairs, 11},
     {NULL, NULL, 0}
 };
