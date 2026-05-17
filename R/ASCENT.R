@@ -467,8 +467,10 @@ basic_p <- function(obs, boot, null = 0) {
 #' @param bin Logical. Binarise ATAC counts?
 #' @param method Character. \code{"glm"} or \code{"fastglm"} for null model.
 #'
-#' @return Data frame with columns: gene, peak, beta, se, z, score_U,
-#'   score_V, score_stat, score_p.
+#' @return Data frame with columns: gene, peak,
+#'   score_beta, score_se, score_z, score_p (model-based),
+#'   score_se_HC0, score_z_HC0, score_p_HC0 (HC0 sandwich),
+#'   score_U, score_V, score_V_HC0, score_stat, score_stat_HC0.
 #' @noRd
 .ASCENT_algorithm_score_r <- function(object, celltype, regr, bin,
                                       method = "glm") {
@@ -560,6 +562,11 @@ basic_p <- function(obs, boot, null = 0) {
     )
     if (is.null(XtWX_inv)) { n_genes_done <- n_genes_done + 1; next }
 
+    # Hat matrix diagonals (once per gene, shared across peaks)
+    Q <- X_null %*% XtWX_inv  # n x p
+    h_diag <- as.numeric(W * rowSums(Q * X_null))
+    h_diag <- pmin(h_diag, 1 - 1e-10)  # clamp to [0, 1)
+
     # Score test each peak linked to this gene
     for (pi in pair_indices) {
       peak <- pairs[[2]][pi]
@@ -574,25 +581,68 @@ basic_p <- function(obs, boot, null = 0) {
       )
 
       U <- sum(b_tilde * e_star)
-      V <- sum(b_tilde^2 * e_star^2)
-      if (V <= 0) next
+      V_HC0 <- sum(b_tilde^2 * e_star^2)
+      if (V_HC0 <= 0) next
 
-      # One-step Newton-Raphson beta from null: beta = U / I, se = sqrt(V) / I
+      # Model-based Fisher information
       I_info <- sum(b_tilde^2 * W)
       if (I_info <= 0) next
-      beta_approx <- U / I_info
-      se_approx   <- sqrt(V) / I_info
-      z_approx    <- U / sqrt(V)
 
-      score_T <- U^2 / V
-      score_p <- pchisq(score_T, df = 1, lower.tail = FALSE)
+      # One-step Newton-Raphson beta
+      beta_approx <- U / I_info
+
+      # Model-based (no HC)
+      se_model    <- 1 / sqrt(I_info)
+      z_model     <- U / sqrt(I_info)
+      score_T     <- U^2 / I_info
+      score_p     <- pchisq(score_T, df = 1, lower.tail = FALSE)
+
+      # HC0 sandwich
+      se_HC0      <- sqrt(V_HC0) / I_info
+      z_HC0       <- U / sqrt(V_HC0)
+      score_T_HC0 <- U^2 / V_HC0
+      score_p_HC0 <- pchisq(score_T_HC0, df = 1, lower.tail = FALSE)
+
+      # HC1 sandwich: V_HC1 = V_HC0 * n/(n-p)
+      hc1_factor  <- n_cells / (n_cells - ncol(X_null))
+      V_HC1       <- V_HC0 * hc1_factor
+      se_HC1      <- sqrt(V_HC1) / I_info
+      z_HC1       <- U / sqrt(V_HC1)
+      score_T_HC1 <- U^2 / V_HC1
+      score_p_HC1 <- pchisq(score_T_HC1, df = 1, lower.tail = FALSE)
+
+      # HC2 sandwich: V_HC2 = sum(b_tilde^2 * e_star^2 / (1 - h_ii))
+      be2 <- b_tilde^2 * e_star^2
+      V_HC2       <- sum(be2 / (1 - h_diag))
+      se_HC2      <- sqrt(V_HC2) / I_info
+      z_HC2       <- U / sqrt(V_HC2)
+      score_T_HC2 <- U^2 / V_HC2
+      score_p_HC2 <- pchisq(score_T_HC2, df = 1, lower.tail = FALSE)
+
+      # HC3 sandwich: V_HC3 = sum(b_tilde^2 * e_star^2 / (1 - h_ii)^2)
+      V_HC3       <- sum(be2 / (1 - h_diag)^2)
+      se_HC3      <- sqrt(V_HC3) / I_info
+      z_HC3       <- U / sqrt(V_HC3)
+      score_T_HC3 <- U^2 / V_HC3
+      score_p_HC3 <- pchisq(score_T_HC3, df = 1, lower.tail = FALSE)
 
       res_idx <- res_idx + 1
       res_list[[res_idx]] <- data.frame(
         gene = gene, peak = peak,
-        beta = beta_approx, se = se_approx, z = z_approx,
-        score_U = U, score_V = V,
-        score_stat = score_T, score_p = score_p,
+        score_beta = beta_approx, score_se = se_model, score_z = z_model,
+        score_p = score_p,
+        score_se_HC0 = se_HC0, score_z_HC0 = z_HC0,
+        score_p_HC0 = score_p_HC0,
+        score_se_HC1 = se_HC1, score_z_HC1 = z_HC1,
+        score_p_HC1 = score_p_HC1,
+        score_se_HC2 = se_HC2, score_z_HC2 = z_HC2,
+        score_p_HC2 = score_p_HC2,
+        score_se_HC3 = se_HC3, score_z_HC3 = z_HC3,
+        score_p_HC3 = score_p_HC3,
+        score_U = U, score_V = I_info, score_V_HC0 = V_HC0,
+        score_stat = score_T, score_stat_HC0 = score_T_HC0,
+        score_stat_HC1 = score_T_HC1,
+        score_stat_HC2 = score_T_HC2, score_stat_HC3 = score_T_HC3,
         stringsAsFactors = FALSE
       )
     }
@@ -758,9 +808,12 @@ CreateASCENTObj <- setClass(
 #'   populated as a \code{data.frame}. For \code{test = "wald"}: columns
 #'   \code{gene}, \code{peak}, \code{beta}, \code{se}, \code{z}, \code{p},
 #'   \code{boot_basic_p} (NA when \code{bootstrap = FALSE}).
-#'   For \code{test = "score"}: columns \code{gene},
-#'   \code{peak}, \code{beta}, \code{se}, \code{z}, \code{score_U},
-#'   \code{score_V}, \code{score_stat}, \code{score_p}.
+#'   For \code{test = "score"}: columns \code{gene}, \code{peak},
+#'   \code{score_beta}, \code{score_se}, \code{score_z}, \code{score_p}
+#'   (model-based, no HC correction),
+#'   \code{score_se_HC0}, \code{score_z_HC0}, \code{score_p_HC0} (HC0 sandwich),
+#'   \code{score_U}, \code{score_V}, \code{score_V_HC0},
+#'   \code{score_stat}, \code{score_stat_HC0}.
 #'
 #' @examples
 #' \dontrun{

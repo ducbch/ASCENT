@@ -889,9 +889,22 @@ Rcpp::DataFrame ascent_score_pairs(
 
     // ---- Pre-allocate per-pair result arrays ----
     std::vector<int>    valid(n_pairs, 0);
-    std::vector<double> r_beta(n_pairs, 0), r_se(n_pairs, 0), r_z(n_pairs, 0);
-    std::vector<double> r_score_U(n_pairs, 0), r_score_V(n_pairs, 0);
-    std::vector<double> r_score_T(n_pairs, 0), r_score_p(n_pairs, 1);
+    std::vector<double> r_beta(n_pairs, 0);
+    std::vector<double> r_se(n_pairs, 0), r_z(n_pairs, 0);           // model-based
+    std::vector<double> r_se_HC0(n_pairs, 0), r_z_HC0(n_pairs, 0);   // HC0 sandwich
+    std::vector<double> r_se_HC1(n_pairs, 0), r_z_HC1(n_pairs, 0);   // HC1 sandwich
+    std::vector<double> r_se_HC2(n_pairs, 0), r_z_HC2(n_pairs, 0);   // HC2 sandwich
+    std::vector<double> r_se_HC3(n_pairs, 0), r_z_HC3(n_pairs, 0);   // HC3 sandwich
+    std::vector<double> r_score_U(n_pairs, 0);
+    std::vector<double> r_score_V(n_pairs, 0), r_score_V_HC0(n_pairs, 0);
+    std::vector<double> r_score_T(n_pairs, 0), r_score_p(n_pairs, 1);         // model-based
+    std::vector<double> r_score_T_HC0(n_pairs, 0), r_score_p_HC0(n_pairs, 1); // HC0 sandwich
+    std::vector<double> r_score_T_HC1(n_pairs, 0), r_score_p_HC1(n_pairs, 1); // HC1 sandwich
+    std::vector<double> r_score_T_HC2(n_pairs, 0), r_score_p_HC2(n_pairs, 1); // HC2 sandwich
+    std::vector<double> r_score_T_HC3(n_pairs, 0), r_score_p_HC3(n_pairs, 1); // HC3 sandwich
+
+    // HC1 correction factor: n / (n - p)
+    double hc1_factor = (double)n_active / (double)(n_active - p_null);
 
     // ---- Set OpenMP thread count ----
 #ifdef _OPENMP
@@ -965,6 +978,13 @@ Rcpp::DataFrame ascent_score_pairs(
             e_star = (rna_vec - null_fit.mu) % (th / (th + null_fit.mu));
         }
 
+        // Hat matrix diagonals: h_ii = W_i * x_i' (X'WX)^{-1} x_i
+        // Computed once per gene, shared across all peaks
+        mat Q = X_null * null_fit.XtWX_inv;  // n x p
+        vec h_diag = W % sum(Q % X_null, 1); // element-wise: W_i * dot(Q_i, X_i)
+        // Clamp h_ii to [0, 1) to avoid division by zero in HC2/HC3
+        h_diag = clamp(h_diag, 0.0, 1.0 - 1e-10);
+
         // For each peak linked to this gene
         for (int pair_idx : pair_list) {
             int pi = peak_idx[pair_idx];
@@ -1008,7 +1028,7 @@ Rcpp::DataFrame ascent_score_pairs(
                 continue;
             }
 
-            // One-step Newton-Raphson beta: beta = U / I, se = sqrt(V) / I
+            // Model-based Fisher information: I = sum(b_tilde^2 * W)
             double I_info = dot(b_tilde % b_tilde, W);  // sum(b_tilde^2 * mu)
             if (I_info <= 0) {
 #ifdef _OPENMP
@@ -1017,22 +1037,71 @@ Rcpp::DataFrame ascent_score_pairs(
                 progress_done++;
                 continue;
             }
+
+            // One-step Newton-Raphson beta: beta = U / I
             double beta_approx = U / I_info;
-            double se_approx   = std::sqrt(V) / I_info;
-            double z_approx    = U / std::sqrt(V);
 
-            double score_T = U * U / V;
-            // Chi-sq(1) survival: P(Z^2 > t) = erfc(sqrt(t/2))
-            double score_p = std::erfc(std::sqrt(score_T / 2.0));
+            // Model-based (no HC): se, z, score stat, p
+            double se_model    = 1.0 / std::sqrt(I_info);
+            double z_model     = U / std::sqrt(I_info);
+            double score_T_mod = U * U / I_info;
+            double score_p_mod = std::erfc(std::sqrt(score_T_mod / 2.0));
 
-            valid[pair_idx]     = 1;
-            r_beta[pair_idx]    = beta_approx;
-            r_se[pair_idx]      = se_approx;
-            r_z[pair_idx]       = z_approx;
-            r_score_U[pair_idx] = U;
-            r_score_V[pair_idx] = V;
-            r_score_T[pair_idx] = score_T;
-            r_score_p[pair_idx] = score_p;
+            // HC0 sandwich: se, z, score stat, p
+            double se_HC0      = std::sqrt(V) / I_info;
+            double z_HC0       = U / std::sqrt(V);
+            double score_T_HC0 = U * U / V;
+            double score_p_HC0 = std::erfc(std::sqrt(score_T_HC0 / 2.0));
+
+            // HC1 sandwich: V_HC1 = V_HC0 * n/(n-p)
+            double V_HC1       = V * hc1_factor;
+            double se_HC1      = std::sqrt(V_HC1) / I_info;
+            double z_HC1       = U / std::sqrt(V_HC1);
+            double score_T_HC1 = U * U / V_HC1;
+            double score_p_HC1 = std::erfc(std::sqrt(score_T_HC1 / 2.0));
+
+            // HC2 sandwich: V_HC2 = sum(b_tilde^2 * e_star^2 / (1 - h_ii))
+            vec be2_hc2 = (be % be) / (1.0 - h_diag);
+            double V_HC2       = accu(be2_hc2);
+            double se_HC2      = std::sqrt(V_HC2) / I_info;
+            double z_HC2       = U / std::sqrt(V_HC2);
+            double score_T_HC2 = U * U / V_HC2;
+            double score_p_HC2 = std::erfc(std::sqrt(score_T_HC2 / 2.0));
+
+            // HC3 sandwich: V_HC3 = sum(b_tilde^2 * e_star^2 / (1 - h_ii)^2)
+            vec one_minus_h = 1.0 - h_diag;
+            vec be2_hc3 = (be % be) / (one_minus_h % one_minus_h);
+            double V_HC3       = accu(be2_hc3);
+            double se_HC3      = std::sqrt(V_HC3) / I_info;
+            double z_HC3       = U / std::sqrt(V_HC3);
+            double score_T_HC3 = U * U / V_HC3;
+            double score_p_HC3 = std::erfc(std::sqrt(score_T_HC3 / 2.0));
+
+            valid[pair_idx]         = 1;
+            r_beta[pair_idx]        = beta_approx;
+            r_se[pair_idx]          = se_model;
+            r_z[pair_idx]           = z_model;
+            r_se_HC0[pair_idx]      = se_HC0;
+            r_z_HC0[pair_idx]       = z_HC0;
+            r_se_HC1[pair_idx]      = se_HC1;
+            r_z_HC1[pair_idx]       = z_HC1;
+            r_se_HC2[pair_idx]      = se_HC2;
+            r_z_HC2[pair_idx]       = z_HC2;
+            r_se_HC3[pair_idx]      = se_HC3;
+            r_z_HC3[pair_idx]       = z_HC3;
+            r_score_U[pair_idx]     = U;
+            r_score_V[pair_idx]     = I_info;
+            r_score_V_HC0[pair_idx] = V;
+            r_score_T[pair_idx]     = score_T_mod;
+            r_score_p[pair_idx]     = score_p_mod;
+            r_score_T_HC0[pair_idx] = score_T_HC0;
+            r_score_p_HC0[pair_idx] = score_p_HC0;
+            r_score_T_HC1[pair_idx] = score_T_HC1;
+            r_score_p_HC1[pair_idx] = score_p_HC1;
+            r_score_T_HC2[pair_idx] = score_T_HC2;
+            r_score_p_HC2[pair_idx] = score_p_HC2;
+            r_score_T_HC3[pair_idx] = score_T_HC3;
+            r_score_p_HC3[pair_idx] = score_p_HC3;
 
 #ifdef _OPENMP
             #pragma omp atomic
@@ -1060,22 +1129,48 @@ Rcpp::DataFrame ascent_score_pairs(
     for (int i = 0; i < n_pairs; i++) n_valid += valid[i];
 
     Rcpp::StringVector  out_gene(n_valid), out_peak(n_valid);
-    Rcpp::NumericVector out_beta(n_valid), out_se(n_valid), out_z(n_valid);
-    Rcpp::NumericVector out_U(n_valid), out_V(n_valid);
+    Rcpp::NumericVector out_beta(n_valid);
+    Rcpp::NumericVector out_se(n_valid), out_z(n_valid);
+    Rcpp::NumericVector out_se_HC0(n_valid), out_z_HC0(n_valid);
+    Rcpp::NumericVector out_se_HC1(n_valid), out_z_HC1(n_valid);
+    Rcpp::NumericVector out_se_HC2(n_valid), out_z_HC2(n_valid);
+    Rcpp::NumericVector out_se_HC3(n_valid), out_z_HC3(n_valid);
+    Rcpp::NumericVector out_U(n_valid), out_V(n_valid), out_V_HC0(n_valid);
     Rcpp::NumericVector out_T(n_valid), out_p(n_valid);
+    Rcpp::NumericVector out_T_HC0(n_valid), out_p_HC0(n_valid);
+    Rcpp::NumericVector out_T_HC1(n_valid), out_p_HC1(n_valid);
+    Rcpp::NumericVector out_T_HC2(n_valid), out_p_HC2(n_valid);
+    Rcpp::NumericVector out_T_HC3(n_valid), out_p_HC3(n_valid);
 
     int idx = 0;
     for (int i = 0; i < n_pairs; i++) {
         if (!valid[i]) continue;
-        out_gene[idx] = gene_names[i];
-        out_peak[idx] = peak_names[i];
-        out_beta[idx] = r_beta[i];
-        out_se[idx]   = r_se[i];
-        out_z[idx]    = r_z[i];
-        out_U[idx]    = r_score_U[i];
-        out_V[idx]    = r_score_V[i];
-        out_T[idx]    = r_score_T[i];
-        out_p[idx]    = r_score_p[i];
+        out_gene[idx]   = gene_names[i];
+        out_peak[idx]   = peak_names[i];
+        out_beta[idx]   = r_beta[i];
+        out_se[idx]     = r_se[i];
+        out_z[idx]      = r_z[i];
+        out_se_HC0[idx] = r_se_HC0[i];
+        out_z_HC0[idx]  = r_z_HC0[i];
+        out_se_HC1[idx] = r_se_HC1[i];
+        out_z_HC1[idx]  = r_z_HC1[i];
+        out_se_HC2[idx] = r_se_HC2[i];
+        out_z_HC2[idx]  = r_z_HC2[i];
+        out_se_HC3[idx] = r_se_HC3[i];
+        out_z_HC3[idx]  = r_z_HC3[i];
+        out_U[idx]      = r_score_U[i];
+        out_V[idx]      = r_score_V[i];
+        out_V_HC0[idx]  = r_score_V_HC0[i];
+        out_T[idx]      = r_score_T[i];
+        out_p[idx]      = r_score_p[i];
+        out_T_HC0[idx]  = r_score_T_HC0[i];
+        out_p_HC0[idx]  = r_score_p_HC0[i];
+        out_T_HC1[idx]  = r_score_T_HC1[i];
+        out_p_HC1[idx]  = r_score_p_HC1[i];
+        out_T_HC2[idx]  = r_score_T_HC2[i];
+        out_p_HC2[idx]  = r_score_p_HC2[i];
+        out_T_HC3[idx]  = r_score_T_HC3[i];
+        out_p_HC3[idx]  = r_score_p_HC3[i];
         idx++;
     }
 
@@ -1083,15 +1178,32 @@ Rcpp::DataFrame ascent_score_pairs(
             n_valid, n_pairs);
 
     return Rcpp::DataFrame::create(
-        Rcpp::Named("gene")       = out_gene,
-        Rcpp::Named("peak")       = out_peak,
-        Rcpp::Named("beta")       = out_beta,
-        Rcpp::Named("se")         = out_se,
-        Rcpp::Named("z")          = out_z,
-        Rcpp::Named("score_U")    = out_U,
-        Rcpp::Named("score_V")    = out_V,
-        Rcpp::Named("score_stat") = out_T,
-        Rcpp::Named("score_p")    = out_p,
-        Rcpp::Named("stringsAsFactors") = false
+        Rcpp::Named("gene")               = out_gene,
+        Rcpp::Named("peak")               = out_peak,
+        Rcpp::Named("score_beta")          = out_beta,
+        Rcpp::Named("score_se")            = out_se,
+        Rcpp::Named("score_z")             = out_z,
+        Rcpp::Named("score_p")             = out_p,
+        Rcpp::Named("score_se_HC0")        = out_se_HC0,
+        Rcpp::Named("score_z_HC0")         = out_z_HC0,
+        Rcpp::Named("score_p_HC0")         = out_p_HC0,
+        Rcpp::Named("score_se_HC1")        = out_se_HC1,
+        Rcpp::Named("score_z_HC1")         = out_z_HC1,
+        Rcpp::Named("score_p_HC1")         = out_p_HC1,
+        Rcpp::Named("score_se_HC2")        = out_se_HC2,
+        Rcpp::Named("score_z_HC2")         = out_z_HC2,
+        Rcpp::Named("score_p_HC2")         = out_p_HC2,
+        Rcpp::Named("score_se_HC3")        = out_se_HC3,
+        Rcpp::Named("score_z_HC3")         = out_z_HC3,
+        Rcpp::Named("score_p_HC3")         = out_p_HC3,
+        Rcpp::Named("score_U")             = out_U,
+        Rcpp::Named("score_V")             = out_V,
+        Rcpp::Named("score_V_HC0")         = out_V_HC0,
+        Rcpp::Named("score_stat")          = out_T,
+        Rcpp::Named("score_stat_HC0")      = out_T_HC0,
+        Rcpp::Named("score_stat_HC1")      = out_T_HC1,
+        Rcpp::Named("score_stat_HC2")      = out_T_HC2,
+        Rcpp::Named("score_stat_HC3")      = out_T_HC3,
+        Rcpp::Named("stringsAsFactors")    = false
     );
 }
