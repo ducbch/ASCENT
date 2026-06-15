@@ -546,7 +546,9 @@ Rcpp::DataFrame ascent_process_pairs(
     bool binarize,
     int regr_type,   // 0 = poisson, 1 = negbin
     int ncores,
-    bool skip_bootstrap = false)
+    bool skip_bootstrap = false,
+    double min_pct_rna = 0.05,
+    double min_pct_atac = 0.05)
 {
     // ---- Extract CSC components from dgCMatrix ----
     Rcpp::IntegerVector rna_i_rv  = rna_sparse.slot("i");
@@ -643,11 +645,11 @@ Rcpp::DataFrame ascent_process_pairs(
             atac_vec.elem(find(atac_vec > 0)).ones();
         }
 
-        // Quality filter: require >5% nonzero in both modalities
+        // Quality filter: require >min_pct nonzero in both modalities
         int n_expr = (int)accu(rna_vec > 0);
         int n_open = (int)accu(atac_vec > 0);
-        if ((double)n_expr / n_active <= 0.05 ||
-            (double)n_open / n_active <= 0.05) {
+        if ((double)n_expr / n_active <= min_pct_rna ||
+            (double)n_open / n_active <= min_pct_atac) {
             // Progress update
 #ifdef _OPENMP
             #pragma omp atomic
@@ -821,7 +823,9 @@ Rcpp::DataFrame ascent_score_pairs(
     Rcpp::LogicalVector cell_mask,
     bool binarize,
     int regr_type,   // 0 = poisson (negbin: future)
-    int ncores)
+    int ncores,
+    double min_pct_rna = 0.05,
+    double min_pct_atac = 0.05)
 {
     // ---- Extract CSC components from dgCMatrix ----
     Rcpp::IntegerVector rna_i_rv  = rna_sparse.slot("i");
@@ -940,9 +944,9 @@ Rcpp::DataFrame ascent_score_pairs(
         extract_sparse_row(rna_pp, rna_ip, rna_xp, gene_row,
                            active_cells, rna_vec);
 
-        // Gene sparsity filter: require >5% nonzero
+        // Gene sparsity filter: require >min_pct_rna nonzero
         int n_expr = (int)accu(rna_vec > 0);
-        if ((double)n_expr / n_active <= 0.05) {
+        if ((double)n_expr / n_active <= min_pct_rna) {
 #ifdef _OPENMP
             #pragma omp atomic
 #endif
@@ -999,7 +1003,7 @@ Rcpp::DataFrame ascent_score_pairs(
 
             // Peak sparsity filter
             int n_open = (int)accu(atac_vec > 0);
-            if ((double)n_open / n_active <= 0.05) {
+            if ((double)n_open / n_active <= min_pct_atac) {
 #ifdef _OPENMP
                 #pragma omp atomic
 #endif

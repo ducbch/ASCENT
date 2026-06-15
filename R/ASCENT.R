@@ -179,7 +179,8 @@ basic_p <- function(obs, boot, null = 0) {
 #'
 #' @return Data frame of results (gene, peak, beta, se, z, p, boot_basic_p).
 #' @noRd
-.ASCENT_algorithm_fastglm <- function(object, celltype, ncores, regr, bin, bootstrap = TRUE) {
+.ASCENT_algorithm_fastglm <- function(object, celltype, ncores, regr, bin, bootstrap = TRUE,
+                                      min_pct_rna = 0.05, min_pct_atac = 0.05) {
   if (!requireNamespace("fastglm", quietly = TRUE))
     stop("Install fastglm: install.packages('fastglm')")
   if (regr == "negbin" && !requireNamespace("MASS", quietly = TRUE))
@@ -215,7 +216,7 @@ basic_p <- function(obs, boot, null = 0) {
 
     nonzero_m <- mean(df2$exprs > 0)
     nonzero_a <- mean(df2$atac > 0)
-    if (nonzero_m <= 0.05 || nonzero_a <= 0.05) next
+    if (nonzero_m <= min_pct_rna || nonzero_a <= min_pct_atac) next
 
     # Predictor names for design matrix
     pred_var <- c("atac", object@covariates)
@@ -352,7 +353,8 @@ basic_p <- function(obs, boot, null = 0) {
 #'
 #' @return Data frame of results (gene, peak, beta, se, z, p, boot_basic_p).
 #' @noRd
-.ASCENT_algorithm_glm <- function(object, celltype, ncores, regr, bin, bootstrap = TRUE) {
+.ASCENT_algorithm_glm <- function(object, celltype, ncores, regr, bin, bootstrap = TRUE,
+                                  min_pct_rna = 0.05, min_pct_atac = 0.05) {
   if (regr == "negbin" && !requireNamespace("MASS", quietly = TRUE))
     stop("Install MASS for negbin: install.packages('MASS')")
   if (bootstrap && !requireNamespace("boot", quietly = TRUE))
@@ -383,7 +385,7 @@ basic_p <- function(obs, boot, null = 0) {
 
     nonzero_m <- mean(df2$exprs > 0)
     nonzero_a <- mean(df2$atac > 0)
-    if (nonzero_m <= 0.05 || nonzero_a <= 0.05) next
+    if (nonzero_m <= min_pct_rna || nonzero_a <= min_pct_atac) next
 
     # Build formula: exprs ~ atac + cov1 + cov2 + ...
     pred_var <- c("atac", object@covariates)
@@ -473,7 +475,9 @@ basic_p <- function(obs, boot, null = 0) {
 #'   score_U, score_V, score_V_HC0, score_stat, score_stat_HC0.
 #' @noRd
 .ASCENT_algorithm_score_r <- function(object, celltype, regr, bin,
-                                      method = "glm") {
+                                      method = "glm",
+                                      min_pct_rna = 0.05,
+                                      min_pct_atac = 0.05) {
   if (method == "fastglm" && !requireNamespace("fastglm", quietly = TRUE))
     stop("Install fastglm: install.packages('fastglm')")
   if (regr == "negbin" && !requireNamespace("MASS", quietly = TRUE))
@@ -509,7 +513,7 @@ basic_p <- function(obs, boot, null = 0) {
     y <- as.numeric(object@rna[gene, target_cells])
 
     # Gene sparsity filter
-    if (mean(y > 0) <= 0.05) { n_genes_done <- n_genes_done + 1; next }
+    if (mean(y > 0) <= min_pct_rna) { n_genes_done <- n_genes_done + 1; next }
 
     # Fit null model (no peak term)
     theta <- 0
@@ -572,7 +576,7 @@ basic_p <- function(obs, boot, null = 0) {
       peak <- pairs[[2]][pi]
       z <- as.numeric(object@atac[peak, target_cells])
       if (bin && any(z > 0)) z[z > 0] <- 1
-      if (mean(z > 0) <= 0.05) next
+      if (mean(z > 0) <= min_pct_atac) next
 
       # b_tilde: residual of WLS regression of atac on X_null
       # Weights: Poisson W=mu, NegBin W=mu*theta/(theta+mu)
@@ -844,7 +848,9 @@ CreateASCENTObj <- setClass(
 ASCENT_algorithm <- function(object, celltype, ncores = 1L,
                              regr = "poisson", bin = TRUE,
                              method = "rcpp", test = "wald",
-                             bootstrap = TRUE) {
+                             bootstrap = TRUE,
+                             min_pct_rna = 0.05,
+                             min_pct_atac = 0.05) {
 
   # ---- Validate inputs ----
   stopifnot(inherits(object, "ASCENT"))
@@ -853,6 +859,32 @@ ASCENT_algorithm <- function(object, celltype, ncores = 1L,
   method <- match.arg(method, c("rcpp", "fastglm", "glm"))
   test   <- match.arg(test, c("wald", "score"))
 
+  # ---- Expand categorical covariates to dummy columns ----
+  meta <- object@meta.data
+  cov_names <- object@covariates
+  expanded_names <- character(0)
+  for (cv in cov_names) {
+    col <- meta[[cv]]
+    if (is.factor(col) || is.character(col)) {
+      fac <- factor(col)
+      lvls <- levels(fac)
+      if (length(lvls) < 2) {
+        warning("Covariate '", cv, "' has < 2 levels, skipping.")
+        next
+      }
+      dummy <- model.matrix(~ fac)[, -1, drop = FALSE]
+      colnames(dummy) <- paste0(cv, "_", lvls[-1])
+      for (cn in colnames(dummy)) meta[[cn]] <- dummy[, cn]
+      expanded_names <- c(expanded_names, colnames(dummy))
+      message(sprintf("Expanded categorical covariate '%s' -> %d dummies (ref: '%s')",
+                      cv, length(lvls) - 1, lvls[1]))
+    } else {
+      expanded_names <- c(expanded_names, cv)
+    }
+  }
+  object@meta.data  <- meta
+  object@covariates <- expanded_names
+
   # ---- Score test dispatch ----
   if (test == "score") {
     if (method %in% c("fastglm", "glm")) {
@@ -860,7 +892,9 @@ ASCENT_algorithm <- function(object, celltype, ncores = 1L,
         "ASCENT [%s/score]: %d pairs | celltype='%s' | %s",
         method, nrow(object@peak.info), celltype, regr
       ))
-      res <- .ASCENT_algorithm_score_r(object, celltype, regr, bin, method)
+      res <- .ASCENT_algorithm_score_r(object, celltype, regr, bin, method,
+                                        min_pct_rna = min_pct_rna,
+                                        min_pct_atac = min_pct_atac)
       object@ASCENT.result <- res
       return(object)
     }
@@ -874,9 +908,11 @@ ASCENT_algorithm <- function(object, celltype, ncores = 1L,
       method, nrow(object@peak.info), celltype, regr, bootstrap, ncores
     ))
     res <- if (method == "fastglm") {
-      .ASCENT_algorithm_fastglm(object, celltype, ncores, regr, bin, bootstrap)
+      .ASCENT_algorithm_fastglm(object, celltype, ncores, regr, bin, bootstrap,
+                                min_pct_rna = min_pct_rna, min_pct_atac = min_pct_atac)
     } else {
-      .ASCENT_algorithm_glm(object, celltype, ncores, regr, bin, bootstrap)
+      .ASCENT_algorithm_glm(object, celltype, ncores, regr, bin, bootstrap,
+                            min_pct_rna = min_pct_rna, min_pct_atac = min_pct_atac)
     }
     object@ASCENT.result <- res
     return(object)
@@ -943,7 +979,9 @@ ASCENT_algorithm <- function(object, celltype, ncores = 1L,
       cell_mask    = cell_mask,
       binarize     = bin,
       regr_type    = regr_int,
-      ncores       = as.integer(ncores)
+      ncores       = as.integer(ncores),
+      min_pct_rna  = min_pct_rna,
+      min_pct_atac = min_pct_atac
     )
   } else {
     message(sprintf(
@@ -963,7 +1001,9 @@ ASCENT_algorithm <- function(object, celltype, ncores = 1L,
       binarize     = bin,
       regr_type    = regr_int,
       ncores       = as.integer(ncores),
-      skip_bootstrap = !bootstrap
+      skip_bootstrap = !bootstrap,
+      min_pct_rna  = min_pct_rna,
+      min_pct_atac = min_pct_atac
     )
   }
 
