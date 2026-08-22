@@ -50,7 +50,7 @@ ASCENT is a **drop-in replacement** for SCENT. The Wald test preserves the same 
 
 ![Score test vs Wald test accuracy — Negative Binomial](fig/ascent_score_accuracy_negbin.png)
 
-*Score test: Beta closely tracks the Wald MLE (ρ > 0.999). SE is systematically above the 1-1 line (sandwich SE > model-based SE), providing conservative inference. Score p-values are highly concordant with bootstrap p-values (ρ > 0.96).*
+*Score test: `score_beta` lands on the 1:1 line with the Wald MLE — unbiased in magnitude, not just in rank (Spearman ρ = 0.9999). The model-based SE closely tracks the Wald SE. Score p-values are highly concordant with bootstrap p-values (ρ > 0.96).*
 
 For a detailed explanation of the optimizations, see [DEEP_README.md](DEEP_README.md).
 
@@ -200,22 +200,24 @@ obj <- CreatePeakToGeneList(
 
 ### `method` — computational backend
 
+`method` applies to the **Wald test only**. The **score test always runs on `"rcpp"`** (if `"fastglm"`/`"glm"` is requested with `test = "score"`, it falls back to `"rcpp"` with a message).
+
 | Method | Description | When to use |
 |--------|-------------|-------------|
 | `"rcpp"` | Full C++/OpenMP engine developed in ASCENT. Parallelizes across pairs. | Default. Production use. |
-| `"fastglm"` | R-based optimisation developed in ASCENT. Replaces `glm()` with [`fastglm::fastglm()`](https://cran.r-project.org/package=fastglm) for ~2x speedup. Bootstrap via `boot::boot(parallel = "multicore")`. | Validation or when C++ compilation is unavailable. |
-| `"glm"` | Original SCENT implementation using base `glm()` / `MASS::glm.nb()`. | Ground-truth reference. |
+| `"fastglm"` | R reference using [`fastglm::fastglm()`](https://cran.r-project.org/package=fastglm); bootstrap via `boot::boot(parallel = "multicore")`. Wald only. | Validation. |
+| `"glm"` | Original SCENT implementation using base `glm()` / `MASS::glm.nb()`. Wald only. | Ground-truth SCENT reference. |
 
-All three methods produce numerically equivalent results (beta correlation = 1.000000).
+The three Wald backends produce numerically equivalent results (beta correlation = 1.000000). `fastglm`, `MASS`, and `boot` are `Suggests` — needed only for the non-default Wald backends.
 
 ### `test` — statistical test
 
 | Test | Description | When to use |
 |------|-------------|-------------|
 | `"wald"` | Wald test with adaptive bootstrap p-values (original SCENT approach). Up to 50,000 bootstrap replicates per pair. | Default. When exact bootstrap p-values are needed. |
-| `"score"` | Score test with HC0 sandwich standard errors. No bootstrap — uses a one-step Newton-Raphson approximation from the null model and analytic p-values. | Recommended for large-scale analyses. Orders of magnitude faster with 97–99% concordance with the wald test. |
+| `"score"` | Model-based score test (rcpp only): an analytic p-value and a refined coefficient estimate for every pair, with no resampling. | Recommended for large-scale analyses. Orders of magnitude faster than the Wald+bootstrap workflow. |
 
-The score test computes beta, SE, z, and p analytically without resampling. This eliminates the computational bottleneck of bootstrapping while maintaining high concordance with the wald test on significance calls.
+The score test computes beta, SE, z, and an analytic p for all pairs without resampling. An **opt-in** selective bootstrap is available via `score_boot_z` (default `Inf` = off): setting a finite value (e.g. `2`) additionally fits the full GLM and adaptively bootstraps the pairs with `|score_z| > score_boot_z`, giving a robust `boot_p` for the significant subset. It is off by default because the bootstrap cost concentrates in those significant pairs, so enabling it makes the score test roughly as slow as the Wald+bootstrap test.
 
 ---
 
@@ -241,10 +243,14 @@ The score test computes beta, SE, z, and p analytically without resampling. This
 |--------|-------------|
 | `gene` | Gene name |
 | `peak` | Peak name |
-| `score_beta` | One-step Newton-Raphson coefficient estimate from the null model |
-| `score_se` | HC0 sandwich standard error |
+| `score_beta` | Coefficient estimate: the one-step Newton-Raphson value for small effects, cheaply refined to the full-model MLE for significant pairs (`\|score_z\| > 2`) |
+| `score_se` | Model-based standard error |
 | `score_z` | z-statistic (`score_beta / score_se`) |
-| `score_p` | Score test p-value (two-sided, analytic — primary result) |
+| `score_p` | Score test p-value (two-sided, analytic) |
+| `boot_p` | Adaptive-bootstrap p-value. `NA` by default; populated only when the opt-in bootstrap is enabled (`score_boot_z` finite), for the pairs with `\|score_z\| > score_boot_z` |
+| `score_U` | Score statistic (`sum(b_tilde * e_star)`) |
+| `score_V` | Fisher information (`sum(b_tilde^2 * W)`) |
+| `score_stat` | Chi-squared(1) test statistic (`score_U^2 / score_V`) |
 
 Pairs that fail the quality filter (<=5% nonzero in either modality) are excluded from the output.
 

@@ -5,7 +5,7 @@ ascent_process_pairs <- function(rna_sparse, atac_sparse, gene_idx_r, peak_idx_r
     .Call(`_ASCENT_ascent_process_pairs`, rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores, skip_bootstrap, min_pct_rna, min_pct_atac)
 }
 
-ascent_score_pairs <- function(rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores, min_pct_rna = 0.05, min_pct_atac = 0.05) {
-    .Call(`_ASCENT_ascent_score_pairs`, rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores, min_pct_rna, min_pct_atac)
+ascent_score_pairs <- function(rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores, min_pct_rna = 0.05, min_pct_atac = 0.05, skip_bootstrap = FALSE) {
+    .Call(`_ASCENT_ascent_score_pairs`, rna_sparse, atac_sparse, gene_idx_r, peak_idx_r, gene_names_r, peak_names_r, cov_mat, cell_mask, binarize, regr_type, ncores, min_pct_rna, min_pct_atac, skip_bootstrap)
 }
 

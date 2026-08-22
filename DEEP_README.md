@@ -55,27 +55,30 @@ When `bootstrap = FALSE`, ASCENT skips the adaptive bootstrap entirely and retur
 
 ## 4. ASCENT Score Test: An Alternative to Bootstrap
 
-### 4.1 Motivation: sandwich SE as an analytical alternative to bootstrap
+### 4.1 Motivation: an analytical alternative to bootstrap
 
-Recall the core problem (Section 1): model-based SEs are unreliable because the assumed variance function doesn't match real single-cell data. SCENT's solution is bootstrap -- resample the data thousands of times to empirically measure the true variability of beta, bypassing the model-based SE entirely.
+Recall the core problem (Section 1): model-based SEs are unreliable when the assumed variance function doesn't match real single-cell data. SCENT's solution is bootstrap -- resample the data thousands of times to empirically measure the true variability of beta, bypassing the model-based SE entirely.
 
-The **HC0 sandwich standard error** attempts to solve the same problem analytically. Instead of assuming a variance function, it uses the observed squared residuals to estimate the true variability of each observation. Where the model-based SE asks "how variable would beta be *if the model were correct*?", the sandwich SE asks "how variable is beta *given what the residuals actually look like*?" -- the same question the bootstrap answers, but without resampling.
-
-This is a well-established approach in econometrics (White, 1980) and increasingly used in genomics.
+The score test replaces the bootstrap with a cheap, one-step analytical test around the null model (details below). A sandwich (HC) standard error was originally added as an analytical stand-in for the bootstrap's robustness to variance misspecification. However, the permutation calibration study (Section 5) showed the sandwich correction does not improve calibration over the model-based score test on this data, so it was removed and the shipped score test is model-based only. The historical sandwich analysis is retained in Section 5 as the rationale.
 
 ### 4.2 Score test output columns
 
-The score test outputs multiple p-value variants for each pair:
+The score test outputs a single, model-based p-value per pair:
 
 | Column | Formula | Description |
 |--------|---------|-------------|
-| `score_p` | U^2 / I_info | Model-based (no sandwich correction) |
-| `score_p_HC0` | U^2 / V_HC0 | HC0 sandwich (raw) |
-| `score_p_HC1` | U^2 / (V_HC0 * n/(n-p)) | HC1 sandwich (degrees-of-freedom corrected) |
-| `score_p_HC2` | U^2 / sum(be^2 / (1-h_ii)) | HC2 sandwich (leverage-adjusted) |
-| `score_p_HC3` | U^2 / sum(be^2 / (1-h_ii)^2) | HC3 sandwich (aggressive leverage correction) |
+| `score_beta` | one-step then joint IRLS | Coefficient estimate: one-step Newton, refined to the MLE for significant pairs; see Section 4.3 |
+| `score_se` | 1 / sqrt(I_info) | Model-based standard error |
+| `score_z` | U / sqrt(I_info) | z-statistic |
+| `score_p` | U^2 / I_info -> chi-sq(1) | Model-based analytic p-value |
+| `boot_p` | adaptive bootstrap | Robust p-value for significant pairs (`\|z\| > score_boot_z`); NA otherwise. See Section 4.6 |
+| `score_U` | sum(b_tilde * e_star) | Score statistic |
+| `score_V` | sum(b_tilde^2 * W) | Fisher information (I_info) |
+| `score_stat` | U^2 / I_info | Chi-squared(1) test statistic |
 
-Where U is the score statistic, I_info = sum(b_tilde^2 * W) is the Fisher information, V_HC0 = sum(b_tilde^2 * e_star^2) is the HC0 sandwich variance, be = b_tilde * e_star, and h_ii are the hat matrix diagonals from the null model.
+Where U is the score statistic and I_info = sum(b_tilde^2 * W) is the Fisher information.
+
+> **Note on HC sandwich variants.** Earlier versions also emitted HC0/HC1/HC2/HC3 sandwich p-values (`score_p_HC0`, etc.). The permutation calibration study (Section 5) found that HC1/HC2/HC3 are indistinguishable from HC0 at n >> p, and that the sandwich correction does not fix the residual score-test inflation (which comes from the one-step approximation, not finite-sample variance bias). All HC variants have been **removed** from the package; only the model-based score test remains.
 
 ### 4.3 How beta is computed: score vs wald
 
@@ -87,6 +90,10 @@ The **score beta** is a one-step approximation. Starting from the null model (be
 
 **Where they diverge:** For large effect sizes, the log-likelihood surface is non-quadratic far from the null. A single Newton step from beta = 0 uses the curvature *at the null*, which overestimates the curvature at the true optimum. The result is that score beta **undershoots** the wald beta: |score beta| < |wald beta|.
 
+**How `score_beta` avoids the undershoot:** Since the undershoot only matters for large effects -- which are exactly the pairs that reach significance -- ASCENT refines the estimate *only for significant pairs* (|z| > 2). For those, it runs a few (3) additional joint IRLS iterations of the full model [covariates | peak], warm-started at the one-step estimate, holding theta fixed for NegBin. Each iteration solves the (p_null + 1) system via a Schur complement so only the peak coefficient is profiled out, reusing the already-fitted null design. This is the same technique used by the `fasthurdle` score test (`refine_beta_joint_ztnb`), adapted to a single-part log-link GLM. Non-significant pairs keep the one-step value, which already matches the MLE for small effects.
+
+Empirically, three iterations recover the full-model MLE to within ~1%. On real PBMC CD14 Monocyte data (1,000 pairs, one peak per gene), across the significant pairs the reported `score_beta` matches the full-GLM Wald MLE to a mean absolute error of 0.000 (Poisson) and 0.001 (NegBin, where ASCENT holds theta fixed while `glm.nb` re-estimates it jointly), versus a mean error of 0.05-0.06 and a maximum of ~0.6 for the un-refined one-step value. The overall correlation with the Wald MLE rises from 0.980 (one-step) to 0.994.
+
 ### 4.4 Null model amortization
 
 When multiple peaks are tested against the same gene, the null model (gene ~ covariates) is **fitted once and reused** for all peaks linked to that gene. The C++ implementation groups pairs by gene and parallelizes at the gene level with OpenMP. In a typical genome-wide analysis, this reduces the number of null model fits from number of peak-gene pairs to number of genes.
@@ -97,9 +104,18 @@ The wald test cost per pair is dominated by bootstrap: up to 50,000 IRLS fits x 
 
 - 1 null model fit (~10-25 IRLS iterations), amortized across all peaks for the same gene
 - 1 matrix solve per peak (no iteration)
-- 1 sandwich variance computation per peak
+- 1 model-based variance computation per peak
 
 This reduces the total IRLS iterations from tens of millions (wald) to tens of thousands (score) -- a reduction of three to four orders of magnitude.
+
+### 4.6 Selective bootstrap: screen with the score test, confirm the hits
+
+The score test's one remaining weakness (Section 5) is a mild p-value inflation. That inflation only matters near the significance threshold -- exactly the pairs with a large `|score_z|`. ASCENT offers an **opt-in screen-then-confirm** stage controlled by the `score_boot_z` parameter (**default `Inf` = off**):
+
+- **All pairs** get the cheap analytic `score_p` and a refined coefficient estimate.
+- **When `score_boot_z` is finite**, pairs with `|score_z| > score_boot_z` are additionally fitted with the full GLM and run through the **same adaptive bootstrap as the Wald test** (100 -> 500 -> ... -> 50,000 replicates), producing a robust `boot_p`. For these pairs `score_beta` is the exact full-model MLE.
+
+This gates the bootstrap at the *pair* level -- the same idea SCENT uses *within* a pair (escalating replicates for promising pairs), extended across pairs. It is **off by default**, for a measured reason: the bootstrap cost is not spread evenly across pairs but concentrates in the significant ones (the escalating pairs), which the gate keeps. On a benchmark of 1,800 pairs at 8 cores, enabling `score_boot_z = 2` bootstrapped ~15% of pairs but ran *as long as or longer than* the Wald+bootstrap over all 1,800 pairs -- because (a) both methods spend nearly all their time escalating the same significant pairs (the null pairs bail out at stage 0 almost for free), and (b) the score engine parallelizes over *genes*, so the bootstrap-heavy pairs cluster on a few threads and load-balance worse than the Wald engine's per-pair parallelism. The takeaway: the score test's speed advantage comes from being **bootstrap-free**; adding the selective bootstrap trades that away. It remains available for users who want resampled p-values on the hits, and is implemented in the rcpp engine only.
 
 ---
 

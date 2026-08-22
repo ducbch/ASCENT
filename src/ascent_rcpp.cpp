@@ -804,11 +804,74 @@ Rcpp::DataFrame ascent_process_pairs(
 
 
 // ================================================================
-// SECTION 6: SCORE TEST (Poisson, HC0 sandwich)
+// Joint IRLS refinement of the peak coefficient.
+//
+// The one-step score beta (U / I_info) undershoots the MLE for large
+// effects. This refines it with a few joint IRLS iterations of the full
+// model [X_null | peak], warm-started at the one-step estimate, holding
+// theta fixed (NegBin). Each iteration solves the (p_null + 1) system via
+// a Schur complement so only the peak coefficient is profiled out.
+// Mirrors fasthurdle's refine_beta_joint_ztnb, adapted to a single-part
+// log-link GLM. 3 iterations suffice for <1% error; intended to be called
+// only on significant pairs (|z| > 2).
+// ================================================================
+static double refine_beta_glm(double beta_init,
+                              const vec& x,        // peak (n)
+                              const vec& y,        // gene counts (n)
+                              const mat& X_null,   // n x p_null
+                              vec& beta_null,      // in/out, length p_null
+                              int regr_type, double theta,
+                              int max_iter = 3)
+{
+    const int p = (int)X_null.n_cols;
+    const double th = (regr_type == 1) ? std::max(theta, 1e-2) : 0.0;
+    double beta_test = beta_init;
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        vec eta = X_null * beta_null + beta_test * x;
+        eta = clamp(eta, -30.0, 30.0);   // guard against exp() overflow
+        vec mu = exp(eta);
+        vec W  = (regr_type == 0) ? mu : (mu % (th / (th + mu)));
+        // Working response (log link, no offset): z = eta + (y - mu)/mu
+        vec z  = eta + (y - mu) / mu;
+
+        // Schur-complement solve for beta_test, profiling out beta_null.
+        vec Wx   = W % x;
+        mat WX   = X_null.each_col() % W;
+        mat XtWX = X_null.t() * WX;          // p x p
+        vec XtWx = X_null.t() * Wx;          // p
+        vec XtWz = X_null.t() * (W % z);     // p
+
+        mat XtWX_inv;
+        if (!inv_sympd(XtWX_inv, XtWX)) {
+            if (!inv(XtWX_inv, XtWX)) break;
+        }
+        double xWz = dot(Wx, z);
+        double xWx = dot(Wx, x);
+        double xt_inv_xz = dot(XtWx, XtWX_inv * XtWz);
+        double xt_inv_xx = dot(XtWx, XtWX_inv * XtWx);
+        double denom = xWx - xt_inv_xx;
+        if (denom <= 0 || !std::isfinite(denom)) break;
+
+        double beta_new = (xWz - xt_inv_xz) / denom;
+        beta_null = XtWX_inv * (XtWz - XtWx * beta_new);
+
+        if (std::abs(beta_new - beta_test) < 1e-6 * (std::abs(beta_test) + 1e-8)) {
+            beta_test = beta_new;
+            break;
+        }
+        beta_test = beta_new;
+    }
+    (void)p;
+    return std::isfinite(beta_test) ? beta_test : beta_init;
+}
+
+// ================================================================
+// SECTION 6: SCORE TEST (model-based score test + refined coefficient)
 //
 // Parallelised across genes (not pairs). For each gene, fits a null
-// Poisson model (without peak term) via IRLS, then computes the robust
-// score statistic for every linked peak using HC0 sandwich variance.
+// GLM (without peak term) via IRLS, then computes the model-based
+// score statistic for every linked peak.
 // ================================================================
 
 // [[Rcpp::export]]
@@ -825,7 +888,8 @@ Rcpp::DataFrame ascent_score_pairs(
     int regr_type,   // 0 = poisson (negbin: future)
     int ncores,
     double min_pct_rna = 0.05,
-    double min_pct_atac = 0.05)
+    double min_pct_atac = 0.05,
+    bool skip_bootstrap = false)  // FALSE (default) = bootstrap every pair (like the Wald test)
 {
     // ---- Extract CSC components from dgCMatrix ----
     Rcpp::IntegerVector rna_i_rv  = rna_sparse.slot("i");
@@ -893,22 +957,17 @@ Rcpp::DataFrame ascent_score_pairs(
 
     // ---- Pre-allocate per-pair result arrays ----
     std::vector<int>    valid(n_pairs, 0);
-    std::vector<double> r_beta(n_pairs, 0);
+    std::vector<double> r_beta(n_pairs, 0);        // refined coefficient estimate
     std::vector<double> r_se(n_pairs, 0), r_z(n_pairs, 0);           // model-based
-    std::vector<double> r_se_HC0(n_pairs, 0), r_z_HC0(n_pairs, 0);   // HC0 sandwich
-    std::vector<double> r_se_HC1(n_pairs, 0), r_z_HC1(n_pairs, 0);   // HC1 sandwich
-    std::vector<double> r_se_HC2(n_pairs, 0), r_z_HC2(n_pairs, 0);   // HC2 sandwich
-    std::vector<double> r_se_HC3(n_pairs, 0), r_z_HC3(n_pairs, 0);   // HC3 sandwich
     std::vector<double> r_score_U(n_pairs, 0);
-    std::vector<double> r_score_V(n_pairs, 0), r_score_V_HC0(n_pairs, 0);
+    std::vector<double> r_score_V(n_pairs, 0);
     std::vector<double> r_score_T(n_pairs, 0), r_score_p(n_pairs, 1);         // model-based
-    std::vector<double> r_score_T_HC0(n_pairs, 0), r_score_p_HC0(n_pairs, 1); // HC0 sandwich
-    std::vector<double> r_score_T_HC1(n_pairs, 0), r_score_p_HC1(n_pairs, 1); // HC1 sandwich
-    std::vector<double> r_score_T_HC2(n_pairs, 0), r_score_p_HC2(n_pairs, 1); // HC2 sandwich
-    std::vector<double> r_score_T_HC3(n_pairs, 0), r_score_p_HC3(n_pairs, 1); // HC3 sandwich
+    std::vector<double> r_boot_p(n_pairs, NA_REAL);  // bootstrap p (NA if not bootstrapped)
 
-    // HC1 correction factor: n / (n - p)
-    double hc1_factor = (double)n_active / (double)(n_active - p_null);
+    // Adaptive bootstrap schedule (same as the Wald path)
+    const int    boot_R[]      = {100,  500,  2500,  25000,  50000};
+    const double boot_thresh[] = {0.1,  0.05, 0.01,  0.001,  0.0};
+    const int    n_stages      = 5;
 
     // ---- Set OpenMP thread count ----
 #ifdef _OPENMP
@@ -982,13 +1041,6 @@ Rcpp::DataFrame ascent_score_pairs(
             e_star = (rna_vec - null_fit.mu) % (th / (th + null_fit.mu));
         }
 
-        // Hat matrix diagonals: h_ii = W_i * x_i' (X'WX)^{-1} x_i
-        // Computed once per gene, shared across all peaks
-        mat Q = X_null * null_fit.XtWX_inv;  // n x p
-        vec h_diag = W % sum(Q % X_null, 1); // element-wise: W_i * dot(Q_i, X_i)
-        // Clamp h_ii to [0, 1) to avoid division by zero in HC2/HC3
-        h_diag = clamp(h_diag, 0.0, 1.0 - 1e-10);
-
         // For each peak linked to this gene
         for (int pair_idx : pair_list) {
             int pi = peak_idx[pair_idx];
@@ -1019,18 +1071,8 @@ Rcpp::DataFrame ascent_score_pairs(
             vec gamma_proj = null_fit.XtWX_inv * v;
             vec b_tilde = atac_vec - X_null * gamma_proj;
 
-            // HC0 sandwich score statistic using weighted residuals
+            // Score statistic using weighted residuals
             double U = dot(b_tilde, e_star);
-            vec be = b_tilde % e_star;
-            double V = dot(be, be);   // sum(b_tilde^2 * e_star^2)
-
-            if (V <= 0) {
-#ifdef _OPENMP
-                #pragma omp atomic
-#endif
-                progress_done++;
-                continue;
-            }
 
             // Model-based Fisher information: I = sum(b_tilde^2 * W)
             double I_info = dot(b_tilde % b_tilde, W);  // sum(b_tilde^2 * mu)
@@ -1042,70 +1084,82 @@ Rcpp::DataFrame ascent_score_pairs(
                 continue;
             }
 
-            // One-step Newton-Raphson beta: beta = U / I
+            // One-step Newton-Raphson beta (warm start only): beta = U / I
             double beta_approx = U / I_info;
 
-            // Model-based (no HC): se, z, score stat, p
+            // Model-based: se, z, score stat, p
             double se_model    = 1.0 / std::sqrt(I_info);
             double z_model     = U / std::sqrt(I_info);
             double score_T_mod = U * U / I_info;
             double score_p_mod = std::erfc(std::sqrt(score_T_mod / 2.0));
 
-            // HC0 sandwich: se, z, score stat, p
-            double se_HC0      = std::sqrt(V) / I_info;
-            double z_HC0       = U / std::sqrt(V);
-            double score_T_HC0 = U * U / V;
-            double score_p_HC0 = std::erfc(std::sqrt(score_T_HC0 / 2.0));
+            // Coefficient estimate + bootstrap p-value.
+            //  - bootstrap on (default): refine the beta for every pair, then
+            //    run the same adaptive bootstrap as the Wald test using the
+            //    refined coefficients as the warm start, giving a boot_p for
+            //    every pair. score_beta stays the refined estimate.
+            //  - bootstrap off (skip_bootstrap): refine only significant pairs
+            //    (|z| > 2), one-step otherwise; boot_p = NA.
+            double beta_final  = beta_approx;
+            double boot_p_val  = NA_REAL;
 
-            // HC1 sandwich: V_HC1 = V_HC0 * n/(n-p)
-            double V_HC1       = V * hc1_factor;
-            double se_HC1      = std::sqrt(V_HC1) / I_info;
-            double z_HC1       = U / std::sqrt(V_HC1);
-            double score_T_HC1 = U * U / V_HC1;
-            double score_p_HC1 = std::erfc(std::sqrt(score_T_HC1 / 2.0));
+            if (!skip_bootstrap) {
+                // Refine beta (all pairs) -> reported estimate + warm start.
+                vec beta_null_local = null_fit.beta;
+                double br = refine_beta_glm(beta_approx, atac_vec, rna_vec,
+                                            X_null, beta_null_local,
+                                            regr_type, null_fit.theta);
+                if (std::isfinite(br)) beta_final = br;
 
-            // HC2 sandwich: V_HC2 = sum(b_tilde^2 * e_star^2 / (1 - h_ii))
-            vec be2_hc2 = (be % be) / (1.0 - h_diag);
-            double V_HC2       = accu(be2_hc2);
-            double se_HC2      = std::sqrt(V_HC2) / I_info;
-            double z_HC2       = U / std::sqrt(V_HC2);
-            double score_T_HC2 = U * U / V_HC2;
-            double score_p_HC2 = std::erfc(std::sqrt(score_T_HC2 / 2.0));
+                // Full design [intercept, atac, covariates] + warm-start coefs.
+                int p_dim = 2 + n_cov;
+                mat Xf(n_active, p_dim);
+                Xf.col(0).ones();
+                Xf.col(1) = atac_vec;
+                for (int j = 0; j < n_cov; j++) Xf.col(2 + j) = cov_sub.col(j);
+                vec warm(p_dim);
+                warm(0) = beta_null_local(0);                       // intercept
+                warm(1) = beta_final;                               // atac (peak)
+                for (int j = 0; j < n_cov; j++) warm(2 + j) = beta_null_local(1 + j);
+                double th = null_fit.theta;
 
-            // HC3 sandwich: V_HC3 = sum(b_tilde^2 * e_star^2 / (1 - h_ii)^2)
-            vec one_minus_h = 1.0 - h_diag;
-            vec be2_hc3 = (be % be) / (one_minus_h % one_minus_h);
-            double V_HC3       = accu(be2_hc3);
-            double se_HC3      = std::sqrt(V_HC3) / I_info;
-            double z_HC3       = U / std::sqrt(V_HC3);
-            double score_T_HC3 = U * U / V_HC3;
-            double score_p_HC3 = std::erfc(std::sqrt(score_T_HC3 / 2.0));
+                // Adaptive bootstrap (per-pair reproducible RNG).
+                std::mt19937 rng(42u + (unsigned)pair_idx);
+                std::uniform_int_distribution<int> cell_dist(0, n_active - 1);
+                boot_p_val = 1.0;
+                for (int stage = 0; stage < n_stages; stage++) {
+                    if (stage > 0 && boot_p_val >= boot_thresh[stage - 1]) break;
+                    int R = boot_R[stage];
+                    std::vector<double> bcs; bcs.reserve(R);
+                    vec freq(n_active);
+                    for (int r = 0; r < R; r++) {
+                        freq.zeros();
+                        for (int c = 0; c < n_active; c++) freq(cell_dist(rng))++;
+                        double bc = (regr_type == 0)
+                            ? poisson_boot_coef(Xf, rna_vec, freq, warm)
+                            : negbin_boot_coef(Xf, rna_vec, freq, warm, th);
+                        if (!std::isnan(bc)) bcs.push_back(bc);
+                    }
+                    if (!bcs.empty()) boot_p_val = basic_p_cpp(beta_final, bcs);
+                }
+            } else if (score_T_mod > 4.0) {
+                // No bootstrap: refine significant pairs for an accurate beta.
+                vec beta_null_local = null_fit.beta;
+                double br = refine_beta_glm(beta_approx, atac_vec, rna_vec,
+                                            X_null, beta_null_local,
+                                            regr_type, null_fit.theta);
+                if (std::isfinite(br)) beta_final = br;
+            }
 
             valid[pair_idx]         = 1;
-            r_beta[pair_idx]        = beta_approx;
+            r_beta[pair_idx]        = beta_final;
+            r_boot_p[pair_idx]      = boot_p_val;
             r_se[pair_idx]          = se_model;
             r_z[pair_idx]           = z_model;
-            r_se_HC0[pair_idx]      = se_HC0;
-            r_z_HC0[pair_idx]       = z_HC0;
-            r_se_HC1[pair_idx]      = se_HC1;
-            r_z_HC1[pair_idx]       = z_HC1;
-            r_se_HC2[pair_idx]      = se_HC2;
-            r_z_HC2[pair_idx]       = z_HC2;
-            r_se_HC3[pair_idx]      = se_HC3;
-            r_z_HC3[pair_idx]       = z_HC3;
             r_score_U[pair_idx]     = U;
             r_score_V[pair_idx]     = I_info;
-            r_score_V_HC0[pair_idx] = V;
             r_score_T[pair_idx]     = score_T_mod;
             r_score_p[pair_idx]     = score_p_mod;
-            r_score_T_HC0[pair_idx] = score_T_HC0;
-            r_score_p_HC0[pair_idx] = score_p_HC0;
-            r_score_T_HC1[pair_idx] = score_T_HC1;
-            r_score_p_HC1[pair_idx] = score_p_HC1;
-            r_score_T_HC2[pair_idx] = score_T_HC2;
-            r_score_p_HC2[pair_idx] = score_p_HC2;
-            r_score_T_HC3[pair_idx] = score_T_HC3;
-            r_score_p_HC3[pair_idx] = score_p_HC3;
 
 #ifdef _OPENMP
             #pragma omp atomic
@@ -1135,46 +1189,23 @@ Rcpp::DataFrame ascent_score_pairs(
     Rcpp::StringVector  out_gene(n_valid), out_peak(n_valid);
     Rcpp::NumericVector out_beta(n_valid);
     Rcpp::NumericVector out_se(n_valid), out_z(n_valid);
-    Rcpp::NumericVector out_se_HC0(n_valid), out_z_HC0(n_valid);
-    Rcpp::NumericVector out_se_HC1(n_valid), out_z_HC1(n_valid);
-    Rcpp::NumericVector out_se_HC2(n_valid), out_z_HC2(n_valid);
-    Rcpp::NumericVector out_se_HC3(n_valid), out_z_HC3(n_valid);
-    Rcpp::NumericVector out_U(n_valid), out_V(n_valid), out_V_HC0(n_valid);
+    Rcpp::NumericVector out_U(n_valid), out_V(n_valid);
     Rcpp::NumericVector out_T(n_valid), out_p(n_valid);
-    Rcpp::NumericVector out_T_HC0(n_valid), out_p_HC0(n_valid);
-    Rcpp::NumericVector out_T_HC1(n_valid), out_p_HC1(n_valid);
-    Rcpp::NumericVector out_T_HC2(n_valid), out_p_HC2(n_valid);
-    Rcpp::NumericVector out_T_HC3(n_valid), out_p_HC3(n_valid);
+    Rcpp::NumericVector out_boot_p(n_valid);
 
     int idx = 0;
     for (int i = 0; i < n_pairs; i++) {
         if (!valid[i]) continue;
-        out_gene[idx]   = gene_names[i];
-        out_peak[idx]   = peak_names[i];
-        out_beta[idx]   = r_beta[i];
+        out_gene[idx]     = gene_names[i];
+        out_peak[idx]     = peak_names[i];
+        out_beta[idx]     = r_beta[i];
         out_se[idx]     = r_se[i];
         out_z[idx]      = r_z[i];
-        out_se_HC0[idx] = r_se_HC0[i];
-        out_z_HC0[idx]  = r_z_HC0[i];
-        out_se_HC1[idx] = r_se_HC1[i];
-        out_z_HC1[idx]  = r_z_HC1[i];
-        out_se_HC2[idx] = r_se_HC2[i];
-        out_z_HC2[idx]  = r_z_HC2[i];
-        out_se_HC3[idx] = r_se_HC3[i];
-        out_z_HC3[idx]  = r_z_HC3[i];
         out_U[idx]      = r_score_U[i];
         out_V[idx]      = r_score_V[i];
-        out_V_HC0[idx]  = r_score_V_HC0[i];
         out_T[idx]      = r_score_T[i];
         out_p[idx]      = r_score_p[i];
-        out_T_HC0[idx]  = r_score_T_HC0[i];
-        out_p_HC0[idx]  = r_score_p_HC0[i];
-        out_T_HC1[idx]  = r_score_T_HC1[i];
-        out_p_HC1[idx]  = r_score_p_HC1[i];
-        out_T_HC2[idx]  = r_score_T_HC2[i];
-        out_p_HC2[idx]  = r_score_p_HC2[i];
-        out_T_HC3[idx]  = r_score_T_HC3[i];
-        out_p_HC3[idx]  = r_score_p_HC3[i];
+        out_boot_p[idx] = r_boot_p[i];
         idx++;
     }
 
@@ -1182,32 +1213,16 @@ Rcpp::DataFrame ascent_score_pairs(
             n_valid, n_pairs);
 
     return Rcpp::DataFrame::create(
-        Rcpp::Named("gene")               = out_gene,
-        Rcpp::Named("peak")               = out_peak,
-        Rcpp::Named("score_beta")          = out_beta,
+        Rcpp::Named("gene")                = out_gene,
+        Rcpp::Named("peak")                = out_peak,
+        Rcpp::Named("score_beta")          = out_beta,      // refined / MLE estimate
         Rcpp::Named("score_se")            = out_se,
         Rcpp::Named("score_z")             = out_z,
         Rcpp::Named("score_p")             = out_p,
-        Rcpp::Named("score_se_HC0")        = out_se_HC0,
-        Rcpp::Named("score_z_HC0")         = out_z_HC0,
-        Rcpp::Named("score_p_HC0")         = out_p_HC0,
-        Rcpp::Named("score_se_HC1")        = out_se_HC1,
-        Rcpp::Named("score_z_HC1")         = out_z_HC1,
-        Rcpp::Named("score_p_HC1")         = out_p_HC1,
-        Rcpp::Named("score_se_HC2")        = out_se_HC2,
-        Rcpp::Named("score_z_HC2")         = out_z_HC2,
-        Rcpp::Named("score_p_HC2")         = out_p_HC2,
-        Rcpp::Named("score_se_HC3")        = out_se_HC3,
-        Rcpp::Named("score_z_HC3")         = out_z_HC3,
-        Rcpp::Named("score_p_HC3")         = out_p_HC3,
+        Rcpp::Named("boot_p")              = out_boot_p,    // NA unless bootstrapped
         Rcpp::Named("score_U")             = out_U,
         Rcpp::Named("score_V")             = out_V,
-        Rcpp::Named("score_V_HC0")         = out_V_HC0,
         Rcpp::Named("score_stat")          = out_T,
-        Rcpp::Named("score_stat_HC0")      = out_T_HC0,
-        Rcpp::Named("score_stat_HC1")      = out_T_HC1,
-        Rcpp::Named("score_stat_HC2")      = out_T_HC2,
-        Rcpp::Named("score_stat_HC3")      = out_T_HC3,
         Rcpp::Named("stringsAsFactors")    = false
     );
 }

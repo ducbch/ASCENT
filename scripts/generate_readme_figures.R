@@ -26,21 +26,22 @@ r3  <- readRDS(file.path(t3dir, "result_rcpp.rds"))
 g3  <- readRDS(file.path(t3dir, "result_glm.rds"))
 r3s <- readRDS(file.path(t3dir, "result_rcpp_score.rds"))
 
+# Map the score result's `score_beta`/`score_se` onto the `beta`/`se` names
+# the plots below expect.
+r2s$beta <- r2s$score_beta; r2s$se <- r2s$score_se
+r3s$beta <- r3s$score_beta; r3s$se <- r3s$score_se
+
 # Timing — extract elapsed (3rd element) as plain numeric
 load_elapsed <- function(path) as.numeric(readRDS(path)[3])
 
 t2_glm_wald   <- load_elapsed(file.path(t2dir, "timing_glm.rds"))
 t2_fglm_wald  <- load_elapsed(file.path(t2dir, "timing_fastglm.rds"))
 t2_rcpp_wald  <- load_elapsed(file.path(t2dir, "timing_rcpp.rds"))
-t2_glm_score  <- load_elapsed(file.path(t2dir, "timing_glm_score.rds"))
-t2_fglm_score <- load_elapsed(file.path(t2dir, "timing_fastglm_score.rds"))
 t2_rcpp_score <- load_elapsed(file.path(t2dir, "timing_rcpp_score.rds"))
 
 t3_glm_wald   <- load_elapsed(file.path(t3dir, "timing_glm.rds"))
 t3_fglm_wald  <- load_elapsed(file.path(t3dir, "timing_fastglm.rds"))
 t3_rcpp_wald  <- load_elapsed(file.path(t3dir, "timing_rcpp.rds"))
-t3_glm_score  <- load_elapsed(file.path(t3dir, "timing_glm_score.rds"))
-t3_fglm_score <- load_elapsed(file.path(t3dir, "timing_fastglm_score.rds"))
 t3_rcpp_score <- load_elapsed(file.path(t3dir, "timing_rcpp_score.rds"))
 
 ## ── Figure 1: Wald accuracy (rcpp vs glm) — Poisson ──────────────────────────
@@ -135,7 +136,7 @@ m2s <- merge(
 p2a <- ggplot(m2s, aes(x = beta.wald, y = beta.score)) +
   geom_point(alpha = 0.3, size = 0.8, color = "#4393C3") +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  labs(x = "Beta (wald)", y = "Beta (score)",
+  labs(x = "Beta (wald)", y = "Beta (score, refined)",
        title = sprintf("Beta  (ρ = %.4f)", cor(m2s$beta.wald, m2s$beta.score, method = "spearman"))) +
   theme_bw(base_size = 11) +
   coord_fixed()
@@ -176,7 +177,7 @@ m3s <- merge(
 p3a <- ggplot(m3s, aes(x = beta.wald, y = beta.score)) +
   geom_point(alpha = 0.3, size = 0.8, color = "#7FBC41") +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  labs(x = "Beta (wald)", y = "Beta (score)",
+  labs(x = "Beta (wald)", y = "Beta (score, refined)",
        title = sprintf("Beta  (ρ = %.4f)", cor(m3s$beta.wald, m3s$beta.score, method = "spearman"))) +
   theme_bw(base_size = 11) +
   coord_fixed()
@@ -207,21 +208,19 @@ fig3 <- p3a + p3b + p3c +
 ggsave(file.path(figdir, "ascent_score_accuracy_negbin.png"), fig3, width = 15, height = 5.5, dpi = 150)
 cat("Saved ascent_score_accuracy_negbin.png\n")
 
-## ── Figure 4: Runtime barplot (Poisson, all 6 methods) ───────────────────────
-method_levels <- c("rcpp (score)", "fastglm (score)", "glm (score)",
-                   "rcpp (wald)", "fastglm (wald)", "glm (wald)")
+## ── Figure 4: Runtime barplot (Poisson) ──────────────────────────────────────
+## Wald backends only. The score test is discussed in the text; its timing is
+## comparable to the Wald test when the bootstrap is enabled.
+method_levels <- c("rcpp (wald)", "fastglm (wald)", "glm (wald)")
 
 method_colors <- c(
-  "rcpp (score)"   = "#4393C3", "fastglm (score)" = "#FDDBC7", "glm (score)"    = "#D6604D",
-  "rcpp (wald)"    = "#2166AC", "fastglm (wald)"  = "#F4A582", "glm (wald)"     = "#B2182B"
+  "rcpp (wald)" = "#2166AC", "fastglm (wald)" = "#F4A582", "glm (wald)" = "#B2182B"
 )
 
 bench_t2 <- data.frame(
-  Method   = factor(c("glm (wald)", "fastglm (wald)", "rcpp (wald)",
-                       "glm (score)", "fastglm (score)", "rcpp (score)"),
+  Method   = factor(c("glm (wald)", "fastglm (wald)", "rcpp (wald)"),
                     levels = method_levels),
-  Time_sec = c(t2_glm_wald, t2_fglm_wald, t2_rcpp_wald,
-               t2_glm_score, t2_fglm_score, t2_rcpp_score),
+  Time_sec = c(t2_glm_wald, t2_fglm_wald, t2_rcpp_wald),
   stringsAsFactors = FALSE
 )
 bench_t2$Time_min <- bench_t2$Time_sec / 60
@@ -251,13 +250,11 @@ p4 <- ggplot(bench_t2, aes(x = Method, y = Time_y, fill = Method)) +
 ggsave(file.path(figdir, "ascent_benchmark.png"), p4, width = 8, height = 5, dpi = 150)
 cat("Saved ascent_benchmark.png\n")
 
-## ── Figure 5: Runtime barplot (NegBin, all 6 methods) ────────────────────────
+## ── Figure 5: Runtime barplot (NegBin) ───────────────────────────────────────
 bench_t3 <- data.frame(
-  Method   = factor(c("glm (wald)", "fastglm (wald)", "rcpp (wald)",
-                       "glm (score)", "fastglm (score)", "rcpp (score)"),
+  Method   = factor(c("glm (wald)", "fastglm (wald)", "rcpp (wald)"),
                     levels = method_levels),
-  Time_sec = c(t3_glm_wald, t3_fglm_wald, t3_rcpp_wald,
-               t3_glm_score, t3_fglm_score, t3_rcpp_score),
+  Time_sec = c(t3_glm_wald, t3_fglm_wald, t3_rcpp_wald),
   stringsAsFactors = FALSE
 )
 bench_t3$Time_min <- bench_t3$Time_sec / 60
