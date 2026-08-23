@@ -8,51 +8,25 @@ ASCENT is a high-performance R package for linking cis-regulatory elements (ATAC
 
 ## Why ASCENT?
 
-SCENT is a powerful statistical framework for identifying enhancer-gene links, but its native R implementation becomes prohibitively slow at genome-wide scale. A typical analysis involves tens of thousands of peak-gene pairs, each requiring up to 50,000 bootstrap GLM fits.
+SCENT is a powerful statistical framework for identifying enhancer-gene links, but its native R implementation becomes prohibitively slow at genome-wide scale. A typical analysis involves tens of thousands of peak-gene pairs, each requiring up to 50,000 bootstrap generalized linear model (GLM) fits.
 
-ASCENT provides three computational backends — the original SCENT algorithm (`glm`), an intermediate R-based optimisation that swaps `glm()` for the faster [`fastglm`](https://cran.r-project.org/package=fastglm) library (`fastglm`), and the full C++/OpenMP engine (`rcpp`) — and two statistical tests: the original **Wald test** with adaptive bootstrap, and a new **score test** that eliminates bootstrapping entirely:
+ASCENT provides three computational backends — the original SCENT algorithm (`glm`), an intermediate R-based optimisation that swaps `glm()` for the faster [`fastglm`](https://cran.r-project.org/package=fastglm) library (`fastglm`), and the full C++/OpenMP engine (`rcpp`) — and two statistical tests: the original **Wald test** with adaptive bootstrap, and a fast **score test** with an analytic p-value and a refined effect-size estimate.
 
-#### Wald test (adaptive bootstrap)
-
-| | glm (original SCENT) | fastglm | rcpp (ASCENT) |
-|---|---|---|---|
-| **Poisson (1,800 pairs, 8 cores)** | 12,918 sec | 7,200 sec | **597 sec** |
-| **Poisson speedup** | 1.0x (baseline) | 1.8x | **21.6x** |
-| **NegBin (32 pairs, 8 cores)** | 6,505 sec | 341 sec | **82 sec** |
-| **NegBin speedup** | 1.0x (baseline) | 19.1x | **79.3x** |
-| **Numerical agreement** | — | r = 1.000000 | r = 1.000000 |
-
-#### Score test (no bootstrap)
-
-| | glm | fastglm | rcpp (ASCENT) |
-|---|---|---|---|
-| **Poisson (1,800 pairs, 8 cores)** | 13.0 sec | 2.1 sec | **0.9 sec** |
-| **Poisson speedup vs glm wald** | 994x | 6,152x | **14,700x** |
-| **NegBin (1,800 pairs, 8 cores)** | 28.8 sec | 5.7 sec | **8.6 sec** |
-| **NegBin speedup vs glm wald** | 5,524x | 27,928x | **18,540x** |
-| **Concordance with wald (p < 0.05)** | — | — | **97–99%** |
-
-*Benchmark on 2,286 CD14 Mono cells. The `glm` method uses base R `glm()` / `MASS::glm.nb()` and is identical to the original SCENT implementation. The `fastglm` method is an R-based optimisation developed as part of ASCENT that replaces the GLM solver with `fastglm::fastglm()`. The `rcpp` method is the full C++/OpenMP engine — the primary contribution of ASCENT.*
+*Benchmarks below are on 2,286 CD14 Mono cells, 1,800 peak-gene pairs, 8 cores. The `glm` method uses base R `glm()` / `MASS::glm.nb()` and is identical to the original SCENT implementation. The `fastglm` method is an R-based optimisation developed as part of ASCENT that replaces the GLM solver with `fastglm::fastglm()`. The `rcpp` method is the full C++/OpenMP engine — the primary contribution of ASCENT.*
 
 ![Benchmark: Poisson, 1,800 pairs, 8 cores](fig/ascent_benchmark.png)
 
 ![Benchmark: Negative Binomial, 1,800 pairs, 8 cores](fig/ascent_benchmark_negbin.png)
 
-ASCENT is a **drop-in replacement** for SCENT. The Wald test preserves the same statistical model (Poisson/Negative Binomial GLM with adaptive bootstrap p-values). The score test provides an analytically equivalent alternative that is orders of magnitude faster, making genome-wide analyses feasible even at large cell counts.
+ASCENT is a **drop-in replacement** for SCENT. The Wald test preserves the same statistical model (Poisson/Negative Binomial GLM with adaptive bootstrap p-values). The score test provides a fast alternative — an analytic p-value and a refined effect-size estimate per pair (with an optional bootstrap) — making genome-wide analyses feasible even at large cell counts.
 
 ![Numerical accuracy: rcpp (ASCENT) vs glm (SCENT) — Wald test, Poisson](fig/ascent_accuracy.png)
 
 ![Numerical accuracy: rcpp (ASCENT) vs glm (SCENT) — Wald test, Negative Binomial](fig/ascent_accuracy_negbin.png)
 
-*Wald test: Beta and SE are numerically identical (ρ ≥ 0.999). Bootstrap p-values show high concordance (ρ ≈ 0.94); the scatter is expected because ASCENT and SCENT use independent RNG streams.*
+*Wald test: beta and standard error are numerically identical (correlation of at least 0.999). Bootstrap p-values are highly concordant (correlation around 0.94); the scatter is expected because ASCENT and SCENT use independent random-number generators.*
 
-![Score test vs Wald test accuracy — Poisson](fig/ascent_score_accuracy.png)
-
-![Score test vs Wald test accuracy — Negative Binomial](fig/ascent_score_accuracy_negbin.png)
-
-*Score test: `score_beta` lands on the 1:1 line with the Wald MLE — unbiased in magnitude, not just in rank (Spearman ρ = 0.9999). The model-based SE closely tracks the Wald SE. Score p-values are highly concordant with bootstrap p-values (ρ > 0.96).*
-
-For a detailed explanation of the optimizations, see [DEEP_README.md](DEEP_README.md).
+The score test is described in the [Score test](#score-test) section below. For a detailed explanation of the optimizations, see [DEEP_README.md](DEEP_README.md).
 
 ---
 
@@ -166,10 +140,11 @@ result <- ASCENT_algorithm(
   obj,
   celltype = "CD14 Mono",
   ncores   = 8L,
-  regr     = "poisson",   # or "negbin"
+  regr     = "negbin",    # or "poisson"
   bin      = TRUE,
   method   = "rcpp",
-  test     = "score"       # score test — no bootstrap
+  test     = "score",      # analytic p-value + refined beta
+  bootstrap = FALSE        # FALSE = fast analytic-only; TRUE adds boot_p
 )
 
 # View results (sorted by score p-value)
@@ -215,9 +190,9 @@ The three Wald backends produce numerically equivalent results (beta correlation
 | Test | Description | When to use |
 |------|-------------|-------------|
 | `"wald"` | Wald test with adaptive bootstrap p-values (original SCENT approach). Up to 50,000 bootstrap replicates per pair. | Default. When exact bootstrap p-values are needed. |
-| `"score"` | Model-based score test (rcpp only): an analytic p-value and a refined coefficient estimate for every pair, with no resampling. | Recommended for large-scale analyses. Orders of magnitude faster than the Wald+bootstrap workflow. |
+| `"score"` | Model-based score test (rcpp only): an analytic p-value and a refined coefficient estimate for every pair, plus an optional adaptive bootstrap (`boot_p`) over all pairs. | Large-scale analyses. With `bootstrap = FALSE`, the analytic-only score test is orders of magnitude faster than the Wald+bootstrap workflow. |
 
-The score test computes beta, SE, z, and an analytic p for all pairs without resampling. An **opt-in** selective bootstrap is available via `score_boot_z` (default `Inf` = off): setting a finite value (e.g. `2`) additionally fits the full GLM and adaptively bootstraps the pairs with `|score_z| > score_boot_z`, giving a robust `boot_p` for the significant subset. It is off by default because the bootstrap cost concentrates in those significant pairs, so enabling it makes the score test roughly as slow as the Wald+bootstrap test.
+See the [Score test](#score-test) section for the implementation and the refined-beta method.
 
 ---
 
@@ -243,16 +218,44 @@ The score test computes beta, SE, z, and an analytic p for all pairs without res
 |--------|-------------|
 | `gene` | Gene name |
 | `peak` | Peak name |
-| `score_beta` | Coefficient estimate: the one-step Newton-Raphson value for small effects, cheaply refined to the full-model MLE for significant pairs (`\|score_z\| > 2`) |
-| `score_se` | Model-based standard error |
-| `score_z` | z-statistic (`score_beta / score_se`) |
+| `score_beta` | Refined coefficient estimate — recovers the full-model maximum likelihood estimate (MLE) (see the [Score test](#score-test) section) |
+| `score_se` | Model-based standard error (`1 / √I`) |
+| `score_z` | Score-test z-statistic (`U / √I`) — drives `score_p` (not `score_beta / score_se`, which differs after refinement) |
 | `score_p` | Score test p-value (two-sided, analytic) |
-| `boot_p` | Adaptive-bootstrap p-value. `NA` by default; populated only when the opt-in bootstrap is enabled (`score_boot_z` finite), for the pairs with `\|score_z\| > score_boot_z` |
+| `boot_p` | Adaptive-bootstrap p-value over all pairs (`bootstrap = TRUE`, default); `NA` when `bootstrap = FALSE` |
 | `score_U` | Score statistic (`sum(b_tilde * e_star)`) |
 | `score_V` | Fisher information (`sum(b_tilde^2 * W)`) |
 | `score_stat` | Chi-squared(1) test statistic (`score_U^2 / score_V`) |
 
 Pairs that fail the quality filter (<=5% nonzero in either modality) are excluded from the output.
+
+---
+
+## Score test
+
+The **score test** evaluates significance at the null model — it never fits a full GLM per peak, so many peaks share one null fit. Fast, with an analytic p-value for every pair. Supports Poisson and negative binomial.
+
+**Fit once per gene.** The null model `gene ~ covariates` (no peak term) is fit by IRLS (iteratively reweighted least squares, the standard algorithm for fitting a GLM). For negative binomial, the dispersion `θ` is estimated here and held fixed.
+
+**Then per peak** (reusing the null fit):
+
+- **score statistic** `U = Σᵢ b̃ᵢ · eᵢ` — `b̃` = peak residualized on the covariates, `e` = working residual
+- **information** `I = Σᵢ b̃ᵢ² · Wᵢ` — `W` = GLM weight (Poisson `μ`; NegBin `μθ/(θ+μ)`)
+- **p-value** `U² / I ∼ χ²₁` — two-sided, analytic
+
+**Refined beta.** A pure score test returns only a p-value; ASCENT also reports an effect size `score_beta`, refined for **every** pair to recover the full-model MLE:
+
+- **warm start** — the one-step estimate `β̂ = U / I`; exact for small effects, but it *undershoots* large ones (one Newton step uses the curvature at `β = 0`)
+- **refine** — up to 3 joint IRLS iterations of the full `[covariates | peak]` model (`θ` fixed), each solving the `(p+1)`-dim system by a Schur complement so only the peak coefficient updates
+- **early-exit** — pairs already at the MLE cost ~1 iteration; large effects reach within ~1% in three
+
+This mirrors the refinement in [`fasthurdle`](https://github.com/mkanai/fasthurdle), adapted to a single-part log-link GLM.
+
+```r
+# Score test — analytic p-value + refined beta
+result <- ASCENT_algorithm(obj, celltype = "CD14 Mono", ncores = 8L,
+                           regr = "negbin", test = "score", bootstrap = FALSE)
+```
 
 ---
 

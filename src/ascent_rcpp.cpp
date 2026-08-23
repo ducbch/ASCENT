@@ -1094,23 +1094,26 @@ Rcpp::DataFrame ascent_score_pairs(
             double score_p_mod = std::erfc(std::sqrt(score_T_mod / 2.0));
 
             // Coefficient estimate + bootstrap p-value.
-            //  - bootstrap on (default): refine the beta for every pair, then
-            //    run the same adaptive bootstrap as the Wald test using the
-            //    refined coefficients as the warm start, giving a boot_p for
-            //    every pair. score_beta stays the refined estimate.
-            //  - bootstrap off (skip_bootstrap): refine only significant pairs
-            //    (|z| > 2), one-step otherwise; boot_p = NA.
+            //  score_beta is ALWAYS the refined estimate (the one-step value is
+            //  only the warm start; refinement early-exits in ~1 iteration when
+            //  the one-step is already at the MLE, so refining every pair is
+            //  cheap). With bootstrap on (default) the same adaptive bootstrap
+            //  as the Wald test is then run over every pair, warm-started at the
+            //  refined coefficients, giving boot_p. With bootstrap off, boot_p
+            //  is NA.
             double beta_final  = beta_approx;
             double boot_p_val  = NA_REAL;
 
-            if (!skip_bootstrap) {
-                // Refine beta (all pairs) -> reported estimate + warm start.
-                vec beta_null_local = null_fit.beta;
+            // Refine beta (all pairs) -> reported estimate + bootstrap warm start.
+            vec beta_null_local = null_fit.beta;
+            {
                 double br = refine_beta_glm(beta_approx, atac_vec, rna_vec,
                                             X_null, beta_null_local,
                                             regr_type, null_fit.theta);
                 if (std::isfinite(br)) beta_final = br;
+            }
 
+            if (!skip_bootstrap) {
                 // Full design [intercept, atac, covariates] + warm-start coefs.
                 int p_dim = 2 + n_cov;
                 mat Xf(n_active, p_dim);
@@ -1142,13 +1145,6 @@ Rcpp::DataFrame ascent_score_pairs(
                     }
                     if (!bcs.empty()) boot_p_val = basic_p_cpp(beta_final, bcs);
                 }
-            } else if (score_T_mod > 4.0) {
-                // No bootstrap: refine significant pairs for an accurate beta.
-                vec beta_null_local = null_fit.beta;
-                double br = refine_beta_glm(beta_approx, atac_vec, rna_vec,
-                                            X_null, beta_null_local,
-                                            regr_type, null_fit.theta);
-                if (std::isfinite(br)) beta_final = br;
             }
 
             valid[pair_idx]         = 1;

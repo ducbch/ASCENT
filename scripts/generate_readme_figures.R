@@ -19,17 +19,10 @@ t3dir <- file.path(basedir, "benchmark_t3_output")
 # T2 Poisson
 r2  <- readRDS(file.path(t2dir, "result_rcpp.rds"))
 g2  <- readRDS(file.path(t2dir, "result_glm.rds"))
-r2s <- readRDS(file.path(t2dir, "result_rcpp_score.rds"))
 
 # T3 NegBin
 r3  <- readRDS(file.path(t3dir, "result_rcpp.rds"))
 g3  <- readRDS(file.path(t3dir, "result_glm.rds"))
-r3s <- readRDS(file.path(t3dir, "result_rcpp_score.rds"))
-
-# Map the score result's `score_beta`/`score_se` onto the `beta`/`se` names
-# the plots below expect.
-r2s$beta <- r2s$score_beta; r2s$se <- r2s$score_se
-r3s$beta <- r3s$score_beta; r3s$se <- r3s$score_se
 
 # Timing — extract elapsed (3rd element) as plain numeric
 load_elapsed <- function(path) as.numeric(readRDS(path)[3])
@@ -37,12 +30,10 @@ load_elapsed <- function(path) as.numeric(readRDS(path)[3])
 t2_glm_wald   <- load_elapsed(file.path(t2dir, "timing_glm.rds"))
 t2_fglm_wald  <- load_elapsed(file.path(t2dir, "timing_fastglm.rds"))
 t2_rcpp_wald  <- load_elapsed(file.path(t2dir, "timing_rcpp.rds"))
-t2_rcpp_score <- load_elapsed(file.path(t2dir, "timing_rcpp_score.rds"))
 
 t3_glm_wald   <- load_elapsed(file.path(t3dir, "timing_glm.rds"))
 t3_fglm_wald  <- load_elapsed(file.path(t3dir, "timing_fastglm.rds"))
 t3_rcpp_wald  <- load_elapsed(file.path(t3dir, "timing_rcpp.rds"))
-t3_rcpp_score <- load_elapsed(file.path(t3dir, "timing_rcpp_score.rds"))
 
 ## ── Figure 1: Wald accuracy (rcpp vs glm) — Poisson ──────────────────────────
 m2 <- merge(
@@ -125,88 +116,6 @@ fig1b <- p1d + p1e + p1f +
 
 ggsave(file.path(figdir, "ascent_accuracy_negbin.png"), fig1b, width = 15, height = 5.5, dpi = 150)
 cat("Saved ascent_accuracy_negbin.png\n")
-
-## ── Figure 2: Score vs Wald accuracy (rcpp) — Poisson ─────────────────────────
-m2s <- merge(
-  r2s[, c("gene","peak","beta","se","score_p")],
-  r2[, c("gene","peak","beta","se","p","boot_basic_p")],
-  by = c("gene","peak"), suffixes = c(".score", ".wald")
-)
-
-p2a <- ggplot(m2s, aes(x = beta.wald, y = beta.score)) +
-  geom_point(alpha = 0.3, size = 0.8, color = "#4393C3") +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  labs(x = "Beta (wald)", y = "Beta (score, refined)",
-       title = sprintf("Beta  (ρ = %.4f)", cor(m2s$beta.wald, m2s$beta.score, method = "spearman"))) +
-  theme_bw(base_size = 11) +
-  coord_fixed()
-
-p2b <- ggplot(m2s, aes(x = se.wald, y = se.score)) +
-  geom_point(alpha = 0.3, size = 0.8, color = "#4393C3") +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  labs(x = "SE (wald)", y = "SE (score)",
-       title = sprintf("SE  (ρ = %.4f)", cor(m2s$se.wald, m2s$se.score, method = "spearman"))) +
-  theme_bw(base_size = 11) +
-  coord_fixed()
-
-p2_pmax <- max(c(-log10(m2s$boot_basic_p), -log10(m2s$score_p)), na.rm = TRUE)
-p2c <- ggplot(m2s, aes(x = -log10(boot_basic_p), y = -log10(score_p))) +
-  geom_point(alpha = 0.3, size = 0.8, color = "#4393C3") +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  labs(x = "-log10(boot_p) wald", y = "-log10(score_p) score",
-       title = sprintf("score_p vs boot_p  (ρ = %.4f)", cor(m2s$boot_basic_p, m2s$score_p, method = "spearman"))) +
-  theme_bw(base_size = 11) +
-  coord_fixed(xlim = c(0, p2_pmax), ylim = c(0, p2_pmax))
-
-fig2 <- p2a + p2b + p2c +
-  plot_annotation(
-    title = "Score test vs Wald test (rcpp) — Poisson",
-    theme = theme(plot.title = element_text(size = 13, face = "bold"))
-  )
-
-ggsave(file.path(figdir, "ascent_score_accuracy.png"), fig2, width = 15, height = 5.5, dpi = 150)
-cat("Saved ascent_score_accuracy.png\n")
-
-## ── Figure 3: Score vs Wald accuracy (rcpp) — NegBin ──────────────────────────
-m3s <- merge(
-  r3s[, c("gene","peak","beta","se","score_p")],
-  r3[, c("gene","peak","beta","se","p","boot_basic_p")],
-  by = c("gene","peak"), suffixes = c(".score", ".wald")
-)
-
-p3a <- ggplot(m3s, aes(x = beta.wald, y = beta.score)) +
-  geom_point(alpha = 0.3, size = 0.8, color = "#7FBC41") +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  labs(x = "Beta (wald)", y = "Beta (score, refined)",
-       title = sprintf("Beta  (ρ = %.4f)", cor(m3s$beta.wald, m3s$beta.score, method = "spearman"))) +
-  theme_bw(base_size = 11) +
-  coord_fixed()
-
-p3b <- ggplot(m3s, aes(x = se.wald, y = se.score)) +
-  geom_point(alpha = 0.3, size = 0.8, color = "#7FBC41") +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  labs(x = "SE (wald)", y = "SE (score)",
-       title = sprintf("SE  (ρ = %.4f)", cor(m3s$se.wald, m3s$se.score, method = "spearman"))) +
-  theme_bw(base_size = 11) +
-  coord_fixed()
-
-p3_pmax <- max(c(-log10(m3s$boot_basic_p), -log10(m3s$score_p)), na.rm = TRUE)
-p3c <- ggplot(m3s, aes(x = -log10(boot_basic_p), y = -log10(score_p))) +
-  geom_point(alpha = 0.3, size = 0.8, color = "#7FBC41") +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  labs(x = "-log10(boot_p) wald", y = "-log10(score_p) score",
-       title = sprintf("score_p vs boot_p  (ρ = %.4f)", cor(m3s$boot_basic_p, m3s$score_p, method = "spearman"))) +
-  theme_bw(base_size = 11) +
-  coord_fixed(xlim = c(0, p3_pmax), ylim = c(0, p3_pmax))
-
-fig3 <- p3a + p3b + p3c +
-  plot_annotation(
-    title = "Score test vs Wald test (rcpp) — Negative Binomial",
-    theme = theme(plot.title = element_text(size = 13, face = "bold"))
-  )
-
-ggsave(file.path(figdir, "ascent_score_accuracy_negbin.png"), fig3, width = 15, height = 5.5, dpi = 150)
-cat("Saved ascent_score_accuracy_negbin.png\n")
 
 ## ── Figure 4: Runtime barplot (Poisson) ──────────────────────────────────────
 ## Wald backends only. The score test is discussed in the text; its timing is
