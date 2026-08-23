@@ -2,10 +2,8 @@ Package: ASCENT
 Type: Package
 Title: Accelerated Single-Cell ENhancer-Target Gene Linking
 Version: 1.0.0
-Authors@R: c(
-    person("Duc", "Nguyen", role = c("aut", "cre"), email = "ngocduc.nguyen@childrens.harvard.edu"),
-    person("Saori", "Sakaue", role = "ctb", comment = "Original SCENT implementation"),
-    person("Shakson", "Isaac", role = "ctb", comment = "Original SCENT implementation"))
+Authors@R:
+    person("Duc", "Nguyen", role = c("aut", "cre"), email = "ngocduc.nguyen@childrens.harvard.edu")
 Description: Rcpp-accelerated reimplementation of SCENT (Single-Cell ENhancer Target)
     for linking ATAC-seq peaks to target genes using single-cell multimodal data.
     Uses Poisson or Negative Binomial regression with empirical p-values via
