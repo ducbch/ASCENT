@@ -96,6 +96,8 @@ Empirically, these iterations recover the full-model MLE to within ~1%. On real 
 
 When multiple peaks are tested against the same gene, the null model (gene ~ covariates) is **fitted once and reused** for all peaks linked to that gene. The C++ implementation groups pairs by gene and parallelizes at the gene level with OpenMP. In a typical genome-wide analysis, this reduces the number of null model fits from number of peak-gene pairs to number of genes.
 
+For negative binomial, the dispersion (theta) is estimated once in this per-gene null fit and then held fixed for every peak and every refinement iteration -- the same fit-theta-once-per-gene strategy ASCENT applies in the Wald bootstrap (Section 3). Theta describes the gene's overdispersion, not the peak-gene association being tested, so fitting it once per gene rather than re-estimating it for each peak is both faster and statistically appropriate.
+
 ### 4.5 Why the analytic score test is fast
 
 With `bootstrap = FALSE`, the score test avoids the Wald test's dominant cost -- the bootstrap (up to 50,000 IRLS fits x 2-5 iterations per pair). It replaces it with:
