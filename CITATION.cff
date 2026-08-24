@@ -1,0 +1,48 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "ASCENT: Accelerated Single-Cell ENhancer-Target Gene Linking"
+abstract: >-
+  ASCENT is a high-performance Rcpp/C++ reimplementation of the SCENT algorithm
+  for linking cis-regulatory elements (ATAC-seq peaks) to their target genes
+  from single-cell multimodal (RNA + ATAC) data. It uses Poisson or negative
+  binomial regression with either a Wald test (adaptive bootstrap) or a fast
+  analytic score test, parallelized across peak-gene pairs with OpenMP.
+type: software
+authors:
+  - given-names: Duc
+    family-names: Nguyen
+    email: ngocduc.nguyen@childrens.harvard.edu
+    affiliation: "Lee Lab, Boston Children's Hospital"
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # <-- ADD your ORCID
+version: 1.0.0
+date-released: "2026-08-23"                             # <-- SET to your GitHub release date (YYYY-MM-DD)
+license: MIT
+repository-code: "https://github.com/ducbch/ASCENT"    # <-- CONFIRM the owner/repo path
+url: "https://github.com/ducbch/ASCENT"
+keywords:
+  - single-cell multiomics
+  - scATAC-seq
+  - scRNA-seq
+  - enhancer-gene linking
+  - peak-gene association
+  - cis-regulatory elements
+  - Rcpp
+  - OpenMP
+# doi: "10.5281/zenodo.XXXXXXX"                         # <-- ADD the Zenodo concept DOI after minting
+references:
+  - type: article
+    title: "Tissue-specific enhancer-gene maps from multimodal single-cell data identify causal disease alleles"
+    # ASCENT reimplements the SCENT method described in this paper.
+    # Verify/complete the author list against the publication.
+    authors:
+      - given-names: Saori
+        family-names: Sakaue
+      - given-names: Kathryn
+        family-names: Weinand
+      - given-names: Shakson
+        family-names: Isaac
+      - given-names: Kushal K.
+        family-names: Dey
+    journal: "Nature Genetics"
+    year: 2024
+    doi: 10.1038/s41588-024-01682-1

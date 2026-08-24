@@ -683,9 +683,9 @@ ASCENT_algorithm <- function(object, celltype, ncores = 1L,
   object@covariates <- expanded_names
 
   # ---- Score test: rcpp only ----
-  # The score test (analytic p-value, refined beta, optional selective
-  # bootstrap) is implemented only in the C++ engine. If a user requests an
-  # R backend for the score test, fall back to rcpp with a message.
+  # The score test (analytic p-value, refined beta, optional bootstrap) is
+  # implemented only in the C++ engine. If a user requests an R backend for
+  # the score test, fall back to rcpp with a message.
   if (test == "score" && method %in% c("fastglm", "glm")) {
     message(sprintf(
       "ASCENT: the score test is implemented in the 'rcpp' engine only; using method='rcpp' (requested '%s').",

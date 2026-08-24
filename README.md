@@ -116,12 +116,13 @@ obj <- CreateASCENTObj(
 ```r
 result <- ASCENT_algorithm(
   obj,
-  celltype = "CD14 Mono",
-  ncores   = 8L,          # OpenMP threads
-  regr     = "poisson",   # or "negbin"
-  bin      = TRUE,         # binarize ATAC counts
-  method   = "rcpp",       # "rcpp" (default), "fastglm", or "glm"
-  test     = "wald"        # default
+  celltype  = "CD14 Mono",
+  ncores    = 8L,          # OpenMP threads
+  regr      = "poisson",   # or "negbin"
+  bin       = TRUE,         # binarize ATAC counts
+  method    = "rcpp",       # "rcpp" (default), "fastglm", or "glm"
+  test      = "wald",       # default
+  bootstrap = TRUE          # TRUE (default) = adaptive bootstrap p-value; FALSE = asymptotic only
 )
 
 # View results (sorted by bootstrap p-value)

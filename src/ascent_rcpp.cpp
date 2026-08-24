@@ -2,8 +2,7 @@
 //
 // Poisson or Negative Binomial GLM with iterative bootstrap for empirical
 // p-values.  Parallelized across peak-gene pairs via OpenMP.
-// Sparse matrix rows extracted directly from dgCMatrix (CSC) format
-// following the BlitzOpen4Gene pattern.
+// Sparse matrix rows extracted directly from dgCMatrix (CSC) format.
 //
 // [[Rcpp::depends(RcppArmadillo)]]
 // [[Rcpp::plugins(openmp)]]

@@ -122,7 +122,7 @@ An important caveat on cost: enabling the bootstrap makes the score test's runti
 
 ## 5. Speed Reference
 
-The "Score (no boot)" column is the analytic-only score test (`bootstrap = FALSE`). With the default `bootstrap = TRUE`, the score test also bootstraps every pair, so its runtime is comparable to the NegBin Wald+Boot column (Section 4.6).
+All times are on **8 cores** (the 2k-cell / 1.8k-pair row is measured; the larger row is extrapolated). The "Score (no boot)" column is the analytic-only score test (`bootstrap = FALSE`); with the default `bootstrap = TRUE`, the score test also bootstraps every pair, so its runtime is comparable to the NegBin Wald+Boot column (Section 4.6).
 
 | Scenario | Score (no boot) | NegBin Wald (no boot) | NegBin Wald+Boot |
 |----------|-----------------|----------------------|------------------|
